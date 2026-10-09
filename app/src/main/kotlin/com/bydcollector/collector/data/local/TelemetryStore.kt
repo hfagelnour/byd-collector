@@ -802,7 +802,7 @@ class TelemetryStore(
         )
     }
 
-    override fun upsertPending(message: HaMqttMessage, targetType: String, priority: Int) {
+    override fun upsertPending(message: HaMqttMessage, targetType: String, priority: Int, destinationKey: String?) {
         val now = clock.nowIso()
         //keeps only the latest retained payload per topic because ha needs current state more than old retries
         val values = ContentValues().apply {
@@ -810,6 +810,7 @@ class TelemetryStore(
             put("topic", message.topic)
             put("payload", message.payload)
             put("payload_hash", sha256(message.payload))
+            if (destinationKey == null) putNull("destination_key") else put("destination_key", destinationKey)
             put("retained", if (message.retained) 1 else 0)
             put("qos", message.qos)
             put("priority", priority)
@@ -853,7 +854,7 @@ class TelemetryStore(
         if (limit <= 0) return emptyList()
         helper.readableDatabase.rawQuery(
             """
-            SELECT target_key, target_type, topic, payload, payload_hash, retained, qos, priority, attempt_count
+            SELECT target_key, target_type, topic, payload, payload_hash, retained, qos, priority, attempt_count, destination_key
             FROM mqtt_outbox
             WHERE next_attempt_at IS NULL OR next_attempt_at <= ?
             ORDER BY priority, updated_at
@@ -875,7 +876,8 @@ class TelemetryStore(
                                 qos = cursor.getInt(6)
                             ),
                             priority = cursor.getInt(7),
-                            attemptCount = cursor.getInt(8)
+                            attemptCount = cursor.getInt(8),
+                            destinationKey = cursor.getString(9)
                         )
                     )
                 }
@@ -883,16 +885,30 @@ class TelemetryStore(
         }
     }
 
-    override fun markAttempt(targetKey: String, payloadHash: String, attemptedAt: String) {
-        helper.writableDatabase.update(
+    override fun isCurrent(targetKey: String, payloadHash: String, destinationKey: String?): Boolean {
+        val (where, args) = mqttOutboxIdentity(targetKey, payloadHash, destinationKey)
+        helper.readableDatabase.rawQuery(
+            "SELECT 1 FROM mqtt_outbox WHERE $where LIMIT 1",
+            args
+        ).use { return it.moveToFirst() }
+    }
+
+    override fun discardPending(targetKey: String, payloadHash: String, destinationKey: String?): Boolean {
+        val (where, args) = mqttOutboxIdentity(targetKey, payloadHash, destinationKey)
+        return helper.writableDatabase.delete("mqtt_outbox", where, args) == 1
+    }
+
+    override fun markAttempt(targetKey: String, payloadHash: String, attemptedAt: String, destinationKey: String?): Boolean {
+        val (where, args) = mqttOutboxIdentity(targetKey, payloadHash, destinationKey)
+        return helper.writableDatabase.update(
             "mqtt_outbox",
             ContentValues().apply {
                 put("last_attempt_at", attemptedAt)
                 put("updated_at", attemptedAt)
             },
-            "target_key = ? AND payload_hash = ?",
-            arrayOf(targetKey, payloadHash)
-        )
+            where,
+            args
+        ) == 1
     }
 
     override fun markFailed(
@@ -900,44 +916,83 @@ class TelemetryStore(
         payloadHash: String,
         error: String,
         failedAt: String,
-        nextAttemptAt: String?
-    ) {
-        val targetType = mqttOutboxTargetType(targetKey, payloadHash) ?: targetTypeForTopic(targetKey)
-        val attemptCount = (mqttOutboxAttemptCount(targetKey, payloadHash) ?: 0) + 1
-        helper.writableDatabase.update(
-            "mqtt_outbox",
-            ContentValues().apply {
-                put("attempt_count", attemptCount)
-                put("last_error", error.truncateForStorage(MAX_ERROR_TEXT_LENGTH))
-                put("last_error_at", failedAt)
-                put("last_attempt_at", failedAt)
-                put("updated_at", failedAt)
-                if (nextAttemptAt == null) putNull("next_attempt_at") else put("next_attempt_at", nextAttemptAt)
-            },
-            "target_key = ? AND payload_hash = ?",
-            arrayOf(targetKey, payloadHash)
-        )
+        nextAttemptAt: String?,
+        destinationKey: String?
+    ): Boolean {
+        val (where, args) = mqttOutboxIdentity(targetKey, payloadHash, destinationKey)
+        val db = helper.writableDatabase
+        db.beginTransaction()
+        val updateResult = try {
+            val existing = db.rawQuery(
+                "SELECT target_type, attempt_count FROM mqtt_outbox WHERE $where LIMIT 1",
+                args
+            ).use { cursor ->
+                if (cursor.moveToFirst()) cursor.getString(0) to (cursor.getInt(1) + 1) else null
+            }
+            if (existing == null) null else {
+                val count = db.update(
+                    "mqtt_outbox",
+                    ContentValues().apply {
+                        put("attempt_count", existing.second)
+                        put("last_error", error.truncateForStorage(MAX_ERROR_TEXT_LENGTH))
+                        put("last_error_at", failedAt)
+                        put("last_attempt_at", failedAt)
+                        put("updated_at", failedAt)
+                        if (nextAttemptAt == null) putNull("next_attempt_at") else put("next_attempt_at", nextAttemptAt)
+                    },
+                    where,
+                    args
+                )
+                if (count == 1) {
+                    db.setTransactionSuccessful()
+                    existing.first
+                } else null
+            }
+        } finally {
+            db.endTransaction()
+        }
+        val targetType = updateResult ?: return false
         recordMqttPublishError(
             targetKey = targetKey,
             targetType = targetType,
             error = error,
             errorAt = failedAt
         )
+        return true
     }
 
-    override fun markPublished(targetKey: String, payloadHash: String, publishedAt: String) {
-        val targetType = mqttOutboxTargetType(targetKey, payloadHash) ?: targetTypeForTopic(targetKey)
-        helper.writableDatabase.delete(
-            "mqtt_outbox",
-            "target_key = ? AND payload_hash = ?",
-            arrayOf(targetKey, payloadHash)
-        )
-        recordMqttPublishSuccess(
-            targetKey = targetKey,
-            targetType = targetType,
-            payloadHash = payloadHash,
-            publishedAt = publishedAt
-        )
+    override fun markPublished(targetKey: String, payloadHash: String, publishedAt: String, destinationKey: String?): Boolean {
+        val (where, args) = mqttOutboxIdentity(targetKey, payloadHash, destinationKey)
+        val db = helper.writableDatabase
+        db.beginTransaction()
+        val targetType: String?
+        val deleted: Int
+        try {
+            targetType = db.rawQuery("SELECT target_type FROM mqtt_outbox WHERE $where LIMIT 1", args).use { cursor ->
+                if (cursor.moveToFirst()) cursor.getString(0) else null
+            }
+            deleted = if (targetType == null) 0 else db.delete("mqtt_outbox", where, args)
+            if (deleted == 1) {
+                recordMqttPublishSuccess(
+                    targetKey = targetKey,
+                    targetType = checkNotNull(targetType),
+                    payloadHash = payloadHash,
+                    publishedAt = publishedAt
+                )
+                db.setTransactionSuccessful()
+            }
+        } finally {
+            db.endTransaction()
+        }
+        return deleted == 1
+    }
+
+    private fun mqttOutboxIdentity(targetKey: String, payloadHash: String, destinationKey: String?): Pair<String, Array<String>> {
+        return if (destinationKey == null) {
+            "target_key = ? AND payload_hash = ? AND destination_key IS NULL" to arrayOf(targetKey, payloadHash)
+        } else {
+            "target_key = ? AND payload_hash = ? AND destination_key = ?" to arrayOf(targetKey, payloadHash, destinationKey)
+        }
     }
 
     override fun pendingCount(): Long = safeScalarLong("SELECT COUNT(*) FROM mqtt_outbox")

@@ -113,6 +113,20 @@ Configure these independent channels on `HA integration`. Connection failures do
 3. Use `Test connection` for the selected profile, then start the channel and enable its automatic start if wanted.
 4. Stop the channel before editing connection settings. The selected profile and the connection currently in use are shown separately.
 
+MQTT identity fields:
+
+- **Device ID** sets the discovery-topic segment and entity unique-ID prefix. Use letters, digits, `_` or `-`.
+- **Device identifier** groups entities into a Home Assistant device.
+- **Device name / model** are display labels; changing them does not change IDs.
+
+Existing Sea Lion 07 defaults remain compatible; blank identity fields use their defaults. For multiple cars, use distinct device identities, state-topic prefixes and MQTT client IDs. Changing identity may create new entities or a device, not rename existing HA `entity_id` values. Old entities are not removed automatically; automation references may need updating.
+
+`MQTT IDs and cleanup` shows the current **Device ID** and recorded IDs, not individual parameter topics. The current ID is protected and remains visible even without recorded history. Select another ID's red trash button and confirm to clear its recorded discovery configurations; state and availability topics are unchanged. The list covers the currently configured primary/alternative addresses and account only; history on other brokers is untouched. Publications from older versions without known broker history cannot be reconstructed. Unconfirmed attempts are marked as outcome unknown.
+
+An ID disappears from the list only after the broker acknowledges its entire group. On partial failure, correct the connection and retry; other IDs are untouched. Cancel/Back before confirmation changes nothing. After confirmation, cleanup continues if the app window closes. Removing discovery may remove HA entities and break automation references; it does not migrate their history or prove that HA has already applied the change.
+
+InfluxDB has a separate **Vehicle ID**, used as the `vehicle` tag (`sea_lion_07` by default, also for blank input). It is independent of MQTT identity. Changing it affects subsequent export, not data already stored in InfluxDB. There is no InfluxDB cleanup action.
+
 Location export is **off by default** for each channel and is separate from local route recording. Enable it only if you want precise coordinates sent to that destination.
 
 MQTT sends current state, so updates can be missed while offline. InfluxDB saves export progress and resumes history after reconnection; a successful connection test does not mean all pending history has been sent.

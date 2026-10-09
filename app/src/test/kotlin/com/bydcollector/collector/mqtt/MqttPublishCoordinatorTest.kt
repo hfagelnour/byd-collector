@@ -10,6 +10,149 @@ import kotlin.test.assertTrue
 
 class MqttPublishCoordinatorTest {
     @Test
+    fun discoveryHistoryUsesQueuedPayloadIdentityInsteadOfLaterSettings() {
+        val config = config()
+        val journal = InMemoryMqttPublicationJournal()
+        val outbox = FakeOutboxStore()
+        val coordinator = coordinator(outbox = outbox, config = config, publicationJournal = journal)
+        outbox.upsertPending(message("homeassistant/sensor/old/config",
+            """{"device":{"identifiers":["queued_id"],"name":"Queued car","model":"Queued model"}}"""),
+            targetType = "discovery", priority = 10)
+        assertTrue(coordinator.flushPending(force = true).ok)
+        val scope = MqttDestinationIdentity.configuredScopes(config).single().key
+        val row = journal.cleanupGroups(setOf(scope), "different_current_id").single()
+        assertEquals("queued_id", row.deviceIdentifier)
+        assertEquals("Queued car", row.deviceName)
+        assertEquals("Queued model", row.deviceModel)
+    }
+
+    @Test
+    fun cleanupEpochDiscardsOldSameIdOutboxAndStartRebuildsCurrentPayloads() {
+        var epoch = 0L
+        val journal = object : MqttPublicationJournalStore by NoopMqttPublicationJournalStore {
+            override fun destinationEpoch(scopeKey: String, deviceId: String): Long = epoch
+        }
+        val config = config()
+        val outbox = FakeOutboxStore()
+        val client = FakeMqttClient()
+        val coordinator = coordinator(client = client, outbox = outbox, config = config, publicationJournal = journal)
+        outbox.upsertPending(message("bydcollector/state/battery", "pre-cleanup"), "state", 50)
+
+        epoch += 1L
+        assertTrue(coordinator.flushPending(force = true).ok)
+        assertTrue(client.published.isEmpty())
+        assertTrue(outbox.pendingRows().isEmpty())
+
+        assertTrue(coordinator.startLiveExport().ok)
+        assertTrue(client.published.any { it.topic == "bydcollector/state/battery" })
+    }
+
+    @Test
+    fun conditionalPublishAckCannotDeletePayloadQueuedAfterTheDueSnapshot() {
+        val outbox = FakeOutboxStore()
+        val client = FakeMqttClient()
+        val coordinator = coordinator(client = client, outbox = outbox)
+        outbox.upsertPending(message("bydcollector/state/battery", "snapshot"), "state", 50)
+        client.afterPublish = {
+            outbox.upsertPending(message("bydcollector/state/battery", "newer"), "state", 50)
+        }
+
+        assertTrue(coordinator.flushPending(force = true).ok)
+        assertEquals("newer", outbox.pendingRows().single().message.payload)
+    }
+
+    @Test
+    fun staleDueSnapshotIsNotSentWhenPayloadChangesDuringConnect() {
+        val outbox = FakeOutboxStore()
+        val client = FakeMqttClient()
+        val coordinator = coordinator(client = client, outbox = outbox)
+        outbox.upsertPending(message("bydcollector/state/battery", "snapshot"), "state", 50)
+        client.afterConnect = {
+            client.afterConnect = null
+            outbox.upsertPending(message("bydcollector/state/battery", "newer"), "state", 50)
+        }
+
+        assertTrue(coordinator.flushPending(force = true).ok)
+        assertTrue(client.published.isEmpty())
+        assertEquals("newer", outbox.pendingRows().single().message.payload)
+    }
+
+    @Test
+    fun discoveryAckHistoryTracksActualFailoverBrokerAndDoesNotInventTombstones() {
+        val config = config(alternativeHost = "backup.local", alternativePort = 1884)
+        val client = FakeMqttClient(
+            connectResults = mutableListOf(MqttActionResult.ok(), MqttActionResult.ok()),
+            publishResults = mutableListOf(
+                MqttActionResult.ok(),
+                MqttActionResult.fail("mqtt_error", "primary dropped", MqttFailureKind.TRANSPORT)
+            )
+        )
+        val journal = InMemoryMqttPublicationJournal()
+        val coordinator = coordinator(client = client, config = config, publicationJournal = journal)
+
+        assertTrue(coordinator.startLiveExport().ok)
+
+        val firstTopic = client.published.first { it.payload.isNotEmpty() }.topic
+        val primaryScope = checkNotNull(MqttDestinationIdentity.scopeForProfile(config, HaEndpointProfile.PRIMARY)).key
+        val alternativeScope = checkNotNull(MqttDestinationIdentity.scopeForProfile(config, HaEndpointProfile.ALTERNATIVE)).key
+        assertEquals(listOf(primaryScope, alternativeScope), journal.attempts.take(2).map { it.scopeKey })
+        assertEquals(firstTopic, journal.attempts[0].topic)
+        assertEquals(firstTopic, journal.attempts[1].topic)
+        assertEquals(alternativeScope, journal.acknowledgements.first { it.topic == firstTopic }.scopeKey)
+        val tombstoneTopic = "homeassistant/binary_sensor/${config.normalizedDeviceId()}/bodywork_sunroof_windoblind_position/config"
+        assertTrue(journal.acknowledgements.any { it.remove && it.topic == tombstoneTopic })
+        assertTrue(!journal.isTracked(alternativeScope, config.normalizedDeviceId(), tombstoneTopic))
+        assertEquals("backup.local", client.connectConfigs.last { it.host == "backup.local" }.host)
+    }
+
+    @Test
+    fun invalidIdentityBlocksEveryPublishingEntryWithoutTouchingQueueAndCanBeCorrected() {
+        var live = config().copy(deviceId = "bad/id")
+        val client = FakeMqttClient()
+        val outbox = FakeOutboxStore().also {
+            it.upsertPending(message("bydcollector/state/battery", "existing"), "state", 50)
+        }
+        val coordinator = coordinator(client = client, outbox = outbox, configProvider = { live })
+        val original = outbox.pendingRows()
+        val results = listOf(
+            coordinator.startLiveExport(),
+            coordinator.queueDiscoveryAndFlush(),
+            coordinator.queueFullResyncAndFlush(),
+            coordinator.queueChangedCategoriesAndFlush(setOf("battery")),
+            coordinator.flushPending(),
+            coordinator.flushPending(force = true)
+        )
+        results.forEach {
+            assertEquals("mqtt_identity_invalid", it.category)
+            assertFalse(it.retryable)
+        }
+        assertEquals(original, outbox.pendingRows())
+        assertEquals(0, client.connectCount)
+        assertEquals(emptyList(), client.published)
+        assertEquals(null, coordinator.retryDelayMs())
+
+        live = live.copy(deviceId = "corrected_2", host = "corrected.local")
+        assertTrue(coordinator.startLiveExport().ok)
+        assertEquals("corrected.local", client.connectConfigs.last().host)
+        assertTrue(client.published.any { "/corrected_2/" in it.topic })
+        assertTrue(client.published.none { "/bad/id/" in it.topic })
+    }
+
+    @Test
+    fun invalidEndpointDoesNotFreezeSessionAndTestConnectionIgnoresDiscoveryIdentity() {
+        var live = config().copy(host = "bad/host")
+        val client = FakeMqttClient()
+        val coordinator = coordinator(client = client, configProvider = { live })
+        assertEquals("mqtt_endpoint_invalid", coordinator.startLiveExport().category)
+        live = live.copy(host = "valid.local", deviceId = "bad/id")
+        assertTrue(coordinator.testConnectionOnly().ok)
+        assertTrue(client.published.isEmpty())
+        live = live.copy(deviceId = "valid")
+        assertTrue(coordinator.startLiveExport().ok)
+        assertEquals("valid.local", client.connectConfigs.last().host)
+    }
+
+    @Test
     fun failedInitialStateReadIsTerminalEvenWhenDiscoveryIsAlreadyQueued() {
         val client = FakeMqttClient()
         val outbox = FakeOutboxStore()
@@ -463,7 +606,7 @@ class MqttPublishCoordinatorTest {
         outbox.upsertPending(message("bydcollector/state/battery", "payload"), targetType = "state", priority = 50)
         outbox.markFailed(
             targetKey = "bydcollector/state/battery",
-            payloadHash = "ignored",
+            payloadHash = outbox.pendingRows().single().payloadHash(),
             error = "broker down",
             failedAt = "2026-06-14T12:00:00+03:00",
             nextAttemptAt = "2026-06-14T12:05:00+03:00"
@@ -607,8 +750,10 @@ class MqttPublishCoordinatorTest {
             listOf(storedState("soc", "battery", valueNumber = 73.0))
         ),
         config: HaMqttConfig = config(),
-        configProvider: () -> HaMqttConfig = { config }
+        configProvider: () -> HaMqttConfig = { config },
+        publicationJournal: MqttPublicationJournalStore = NoopMqttPublicationJournalStore
     ): MqttPublishCoordinator {
+        outbox.bindDestination(MqttDestinationIdentity.destinationKey(configProvider(), publicationJournal))
         return MqttPublishCoordinator(
             client = client,
             outbox = outbox,
@@ -620,7 +765,8 @@ class MqttPublishCoordinatorTest {
             ),
             configProvider = configProvider,
             retryPolicy = MqttRetryPolicy(),
-            clock = FakeClock()
+            clock = FakeClock(),
+            publicationJournal = publicationJournal
         )
     }
 
@@ -636,6 +782,8 @@ class MqttPublishCoordinatorTest {
         var connectedState = false
         var connectCount = 0
         var disconnectCount = 0
+        var afterConnect: (() -> Unit)? = null
+        var afterPublish: (() -> Unit)? = null
 
         override val isConnected: Boolean
             get() = connectedState
@@ -654,11 +802,13 @@ class MqttPublishCoordinatorTest {
             willMessages += willMessage
             return (if (connectResults.isEmpty()) connectResult else connectResults.removeAt(0)).also {
                 connectedState = it.ok
+                if (it.ok) afterConnect?.invoke()
             }
         }
 
         override fun publish(message: HaMqttMessage): MqttActionResult {
             published += message
+            afterPublish?.invoke()
             return if (publishResults.isEmpty()) MqttActionResult.ok() else publishResults.removeAt(0)
         }
 
@@ -674,7 +824,14 @@ class MqttPublishCoordinatorTest {
     private class FakeOutboxStore : MqttOutboxStore {
         private val rows = linkedMapOf<String, PendingRow>()
 
-        override fun upsertPending(message: HaMqttMessage, targetType: String, priority: Int) {
+        private var boundDestinationKey: String? = null
+
+        fun bindDestination(destinationKey: String) {
+            boundDestinationKey = destinationKey
+            rows.replaceAll { _, row -> if (row.destinationKey == null) row.copy(destinationKey = destinationKey) else row }
+        }
+
+        override fun upsertPending(message: HaMqttMessage, targetType: String, priority: Int, destinationKey: String?) {
             val existing = rows[message.topic]
             rows[message.topic] = PendingRow(
                 targetKey = message.topic,
@@ -682,7 +839,8 @@ class MqttPublishCoordinatorTest {
                 message = message,
                 priority = priority,
                 attemptCount = existing?.attemptCount ?: 0,
-                lastError = existing?.lastError
+                lastError = existing?.lastError,
+                destinationKey = destinationKey ?: boundDestinationKey
             )
         }
 
@@ -701,8 +859,21 @@ class MqttPublishCoordinatorTest {
                 .map { it.toPending() }
         }
 
-        override fun markAttempt(targetKey: String, payloadHash: String, attemptedAt: String) {
+        override fun isCurrent(targetKey: String, payloadHash: String, destinationKey: String?): Boolean {
+            val row = rows[targetKey] ?: return false
+            return row.payloadHash() == payloadHash && row.destinationKey == destinationKey
+        }
+
+        override fun discardPending(targetKey: String, payloadHash: String, destinationKey: String?): Boolean {
+            if (!isCurrent(targetKey, payloadHash, destinationKey)) return false
+            rows.remove(targetKey)
+            return true
+        }
+
+        override fun markAttempt(targetKey: String, payloadHash: String, attemptedAt: String, destinationKey: String?): Boolean {
+            if (!isCurrent(targetKey, payloadHash, destinationKey)) return false
             rows[targetKey]?.let { rows[targetKey] = it.copy(attemptCount = it.attemptCount + 1) }
+            return true
         }
 
         override fun markFailed(
@@ -710,13 +881,18 @@ class MqttPublishCoordinatorTest {
             payloadHash: String,
             error: String,
             failedAt: String,
-            nextAttemptAt: String?
-        ) {
+            nextAttemptAt: String?,
+            destinationKey: String?
+        ): Boolean {
+            if (!isCurrent(targetKey, payloadHash, destinationKey)) return false
             rows[targetKey]?.let { rows[targetKey] = it.copy(lastError = error, nextAttemptAt = nextAttemptAt) }
+            return true
         }
 
-        override fun markPublished(targetKey: String, payloadHash: String, publishedAt: String) {
+        override fun markPublished(targetKey: String, payloadHash: String, publishedAt: String, destinationKey: String?): Boolean {
+            if (!isCurrent(targetKey, payloadHash, destinationKey)) return false
             rows.remove(targetKey)
+            return true
         }
 
         override fun pendingCount(): Long = rows.size.toLong()
@@ -731,7 +907,8 @@ class MqttPublishCoordinatorTest {
         val priority: Int,
         val attemptCount: Int,
         val lastError: String?,
-        val nextAttemptAt: String? = null
+        val nextAttemptAt: String? = null,
+        val destinationKey: String? = null
     ) {
         fun toPending(): PendingMqttMessage {
             return PendingMqttMessage(
@@ -740,9 +917,12 @@ class MqttPublishCoordinatorTest {
                 payloadHash = message.payload.hashCode().toString(),
                 message = message,
                 priority = priority,
-                attemptCount = attemptCount
+                attemptCount = attemptCount,
+                destinationKey = destinationKey
             )
         }
+
+        fun payloadHash(): String = message.payload.hashCode().toString()
     }
 
     private class FakeRetryStateStore(

@@ -16,12 +16,29 @@ class InfluxConfigTest {
     @Test
     fun selectedEndpointClearsAlternativePair() {
         val selected = config(alternativeHost = "influx-alt.local", alternativePort = 8087)
+            .copy(vehicleId = "custom car,ev=2")
             .forProfile(HaEndpointProfile.ALTERNATIVE)
 
         assertEquals("influx-alt.local", selected.host)
         assertEquals(8087, selected.port)
+        assertEquals("custom car,ev=2", selected.vehicleId)
         assertNull(selected.alternativeHost)
         assertNull(selected.alternativePort)
+    }
+
+    @Test
+    fun vehicleIdUsesSeaLionDefaultWhenBlank() {
+        assertEquals(InfluxConfig.DEFAULT_VEHICLE_ID, config().vehicleId)
+        assertEquals(InfluxConfig.DEFAULT_VEHICLE_ID, config().copy(vehicleId = "").normalizedVehicleId())
+        assertNull(config().copy(vehicleId = " ").validateVehicleId())
+    }
+
+    @Test
+    fun vehicleIdRejectsLineBreaksAndNul() {
+        listOf("bad\r", "bad\n", "bad\u0000").forEach { value ->
+            assertNotNull(config().copy(vehicleId = value).validateVehicleId())
+            assertEquals(false, InfluxConfig.isValidVehicleId(value))
+        }
     }
 
     @Test
@@ -33,7 +50,8 @@ class InfluxConfigTest {
     private fun config(
         host: String = "influx.local",
         alternativeHost: String? = null,
-        alternativePort: Int? = null
+        alternativePort: Int? = null,
+        vehicleId: String = InfluxConfig.DEFAULT_VEHICLE_ID
     ) = InfluxConfig(
         enabled = true,
         host = host,
@@ -44,6 +62,7 @@ class InfluxConfigTest {
         measurement = "byd_state",
         enabledCategories = setOf("battery"),
         alternativeHost = alternativeHost,
-        alternativePort = alternativePort
+        alternativePort = alternativePort,
+        vehicleId = vehicleId
     )
 }

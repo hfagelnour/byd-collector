@@ -77,7 +77,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
 private val CardShape = RoundedCornerShape(8.dp)
-private val ControlShape = RoundedCornerShape(7.dp)
+internal val ControlShape = RoundedCornerShape(7.dp)
 private val PillShape = RoundedCornerShape(50)
 private const val PRESS_FEEDBACK_MS = 100L
 
@@ -339,7 +339,8 @@ fun ActionButton(
     primary: Boolean = false,
     enabled: Boolean = true,
     listAction: Boolean = false,
-    fontSize: TextUnit = 14.sp
+    fontSize: TextUnit = 14.sp,
+    danger: Boolean = false
 ) {
     val p = LocalBydPalette.current
     val interactionSource = remember { MutableInteractionSource() }
@@ -348,6 +349,7 @@ fun ActionButton(
     val visualPressed = pressed || press.visualPressed
     val bg = when {
         !enabled -> p.disabled.copy(alpha = 0.55f)
+        danger -> p.redSoft.copy(alpha = if (visualPressed) 1f else 0.56f)
         listAction && visualPressed -> p.accent.copy(alpha = if (p.dark) 0.24f else 0.14f)
         listAction -> p.accent.copy(alpha = if (p.dark) 0.20f else 0.04f)
         primary && visualPressed -> p.active
@@ -358,11 +360,13 @@ fun ActionButton(
     val border = when {
         !enabled && listAction -> p.borderStrong.copy(alpha = 0.68f)
         !enabled -> p.borderStrong
+        danger -> p.red
         listAction || primary -> p.accent
         else -> p.borderStrong
     }
     val fg = when {
         !enabled -> p.muted.copy(alpha = 0.65f)
+        danger -> p.red
         primary -> p.accentText
         else -> p.text
     }

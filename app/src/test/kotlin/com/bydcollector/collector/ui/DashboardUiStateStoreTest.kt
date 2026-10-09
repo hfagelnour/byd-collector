@@ -1,5 +1,6 @@
 package com.bydcollector.collector.ui
 
+import com.bydcollector.collector.dashboardSnapshotDue
 import com.bydcollector.collector.data.local.CollectorEvent
 import com.bydcollector.collector.data.callback.CallbackQueuePhase
 import com.bydcollector.collector.data.callback.CallbackQueueState
@@ -15,6 +16,66 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class DashboardUiStateStoreTest {
+    @Test
+    fun firstClientSnapshotIncludesLiveQueuesWithoutDatabaseHealth() {
+        val store = DashboardUiStateStore { 1L }
+        val initial = dashboardState("initial")
+        val flags = DashboardRuntimeFlags(
+            serviceRunning = true, mainPollingRunning = true, debugPollingRunning = true,
+            pollingEnabled = false, debugPollingEnabled = false, mqttEnabled = false, influxEnabled = false,
+            permissionsGranted = true, adbAuthorized = true, dbMaintenanceStatus = DbMaintenanceRuntimeStatus(),
+            archiveStorageJobStatus = ArchiveStorageJobStatus(),
+            mainCallbackQueue = CallbackQueueState(CallbackQueuePhase.HEALTHY, null),
+            secondaryCallbackQueue = CallbackQueueState(CallbackQueuePhase.CATCHING_UP, "pending_head_age"))
+        store.publishRuntimeFlags(flags)
+
+        val first = store.snapshotForClient(initial, VehicleKpiLanguage.UK)
+        assertTrue(first.mainPollingRunning)
+        assertTrue(first.debugPollingRunning)
+        assertFalse(first.pollingEnabled)
+        assertFalse(first.debugPollingEnabled)
+        assertNull(first.lastPollStatus)
+        assertEquals(flags.mainCallbackQueue, first.mainCallbackQueue)
+        assertEquals(flags.secondaryCallbackQueue, first.secondaryCallbackQueue)
+
+        val stopped = flags.copy(mainPollingRunning = false, mainRuntimeStatus = RuntimeActionStatus.STOPPED,
+            mainCallbackQueue = null, debugRuntimeStatus = DebugRuntimeStatus.ERROR,
+            secondaryCallbackQueue = CallbackQueueState(CallbackQueuePhase.ERROR, "reader_failed"))
+        store.publishRuntimeFlags(stopped)
+        val reopened = store.snapshotForClient(initial, VehicleKpiLanguage.EN)
+        assertFalse(reopened.mainPollingRunning)
+        assertEquals(RuntimeActionStatus.STOPPED, reopened.mainRuntimeStatus)
+        assertNull(reopened.mainCallbackQueue)
+        assertEquals(DebugRuntimeStatus.ERROR, reopened.debugRuntimeStatus)
+        assertEquals(stopped.secondaryCallbackQueue, reopened.secondaryCallbackQueue)
+    }
+
+    @Test
+    fun frequentCachedUpdatesCannotStarveStorageCompletionOrChromeRefresh() {
+        var now = 100L
+        val store = DashboardUiStateStore { now }
+        val pending = dashboardState("storage").copy(archiveStorageScanPending = true)
+        store.seed(pending)
+        // Notifications arrive faster than the 1 s pending-storage refresh deadline.
+        repeat(9) {
+            now += 100L
+            store.publishTab(AppTab.STORAGE, store.beginTabRefresh(AppTab.STORAGE), pending, dataRefreshed = false)
+            store.publishChrome(store.beginChromeRefresh(), pending, dataRefreshed = false)
+        }
+        assertEquals(100L, store.tabState(AppTab.STORAGE).value!!.loadedAtElapsedMs)
+        assertEquals(100L, store.chromeState.value!!.loadedAtElapsedMs)
+        now = 1_100L
+        assertTrue(dashboardSnapshotDue(store.tabState(AppTab.STORAGE).value!!.loadedAtElapsedMs, 1_000L, now))
+        store.publishTab(AppTab.STORAGE, store.beginTabRefresh(AppTab.STORAGE), pending.copy(archiveStorageScanPending = false))
+        assertFalse(store.currentTab(AppTab.STORAGE)!!.archiveStorageScanPending)
+        assertTrue(store.currentTab(AppTab.STORAGE)!!.archiveStorageSnapshot.entries.isEmpty())
+        assertEquals(now, store.tabState(AppTab.STORAGE).value!!.loadedAtElapsedMs)
+
+        store.markTabStale(AppTab.STORAGE)
+        store.publishTab(AppTab.STORAGE, store.beginTabRefresh(AppTab.STORAGE), pending, dataRefreshed = false)
+        assertEquals(0L, store.tabState(AppTab.STORAGE).value!!.loadedAtElapsedMs)
+    }
+
     @Test
     fun liveQueuesStayIndependentAndSurviveAnOlderDatabaseSnapshot() {
         val store = DashboardUiStateStore { 1L }
@@ -342,6 +403,10 @@ class DashboardUiStateStoreTest {
             mqttClientId = "",
             mqttTopicPrefix = "",
             mqttDiscoveryPrefix = "",
+            mqttDeviceId = "",
+            mqttDeviceIdentifier = "",
+            mqttDeviceName = "",
+            mqttDeviceModel = "",
             mqttEnabledCategories = emptySet(),
             mqttStatus = "disabled",
             mqttLastError = null,
@@ -360,6 +425,7 @@ class DashboardUiStateStoreTest {
             influxUsername = "",
             influxPasswordSet = false,
             influxMeasurement = "",
+            influxVehicleId = "",
             influxEnabledCategories = emptySet(),
             influxStatus = "stopped",
             influxPendingRows = 0L,

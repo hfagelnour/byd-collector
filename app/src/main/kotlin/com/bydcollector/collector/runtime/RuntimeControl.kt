@@ -29,6 +29,13 @@ internal object RuntimeControl {
     private fun onMain(app: BydCollectorApplication, op: String, args: Bundle): Bundle = Bundle().apply {
         val update = app.updateRuntime
         when (op) {
+            "accessFlow" -> {
+                val request = requireNotNull(args.getString("request"))
+                require(request in setOf("adb", "overlay", "background"))
+                app.startActivity(android.content.Intent(app, RuntimeLauncherActivity::class.java)
+                    .putExtra("accessRequest", request)
+                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+            }
             "visibility" -> {
                 val token = requireNotNull(args.getBinder("token"))
                 if (!observers.containsKey(token)) {

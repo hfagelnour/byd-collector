@@ -1,5 +1,8 @@
 package com.bydcollector.collector.ui.compose
 
+import com.bydcollector.collector.influx.InfluxConfig
+import com.bydcollector.collector.mqtt.MqttCleanupGroup
+import com.bydcollector.collector.mqtt.MqttCleanupSelection
 import com.bydcollector.collector.telegram.TelegramNavigatorMask
 import com.bydcollector.collector.telegram.TelegramPayloadLimitState
 import com.bydcollector.collector.ha.HaEndpointProfile
@@ -19,6 +22,10 @@ data class MqttDraft(
     val clientId: String = "",
     val topicPrefix: String = "",
     val discoveryPrefix: String = "",
+    val deviceId: String = "",
+    val deviceIdentifier: String = "",
+    val deviceName: String = "",
+    val deviceModel: String = "",
     val alternativeHost: String = "",
     val alternativePort: String = "",
     val editingProfile: HaEndpointProfile = HaEndpointProfile.PRIMARY
@@ -31,6 +38,7 @@ data class InfluxDraft(
     val password: String = "",
     val database: String = "",
     val measurement: String = "",
+    val vehicleId: String = InfluxConfig.DEFAULT_VEHICLE_ID,
     val alternativeHost: String = "",
     val alternativePort: String = "",
     val editingProfile: HaEndpointProfile = HaEndpointProfile.PRIMARY
@@ -43,7 +51,14 @@ data class BydCollectorActionUiState(
     val archiveShareHandoffGeneration: Long = 0L,
     val archiveDeleteDispatch: Boolean = false,
     val mqttTest: Boolean = false,
+    val mqttCleanup: Boolean = false,
     val influxTest: Boolean = false
+)
+
+data class MqttCleanupUiState(
+    val groups: List<MqttCleanupGroup> = emptyList(),
+    val loading: Boolean = false,
+    val error: String? = null
 )
 
 enum class TripMapMetric {
@@ -261,6 +276,8 @@ interface BydCollectorActions {
     fun onToggleMqttAutoStart(enabled: Boolean)
     fun onToggleMqttCategory(category: String, enabled: Boolean)
     fun onMqttDraftChanged(draft: MqttDraft)
+    fun onRefreshMqttCleanup()
+    fun onCleanupMqttIdentity(selection: MqttCleanupSelection)
 
     fun onStartInflux()
     fun onStopInflux()

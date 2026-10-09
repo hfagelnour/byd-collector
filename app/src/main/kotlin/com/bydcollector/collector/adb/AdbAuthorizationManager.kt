@@ -46,6 +46,42 @@ object AdbAuthorizationManager {
         AccessRuntimeSnapshot(snapshot.getBoolean("accessPermissions"), snapshot.getBoolean("accessAdb"))
     } else runtimeSnapshot
 
+    /** Bootstrap must not open telemetry databases or depend on the separate UI APK. */
+    fun requestStartupAccess(context: Context, manual: Boolean, onTerminal: () -> Unit) {
+        val app = context.applicationContext
+        val terminalDelivered = AtomicBoolean(false)
+        val terminal = { if (terminalDelivered.compareAndSet(false, true)) onTerminal() }
+        val submitted = coordinator.submit(AccessCheckMode.FORCE, onTerminal = terminal) { lease ->
+            try {
+                val client = AdbLocalClient(File(app.filesDir, "adb_keys"), cancellation = lease.cancellation,
+                    eventSink = { category, message, detail -> recordObservation(app, category, "$message ${detail.orEmpty()}") })
+                var result = client.checkAuthorizationReadOnly()
+                if (result.category == "adb_authorization_required" &&
+                    (manual || automaticPromptAttemptedInProcess.compareAndSet(false, true))) {
+                    automaticPromptAttemptedInProcess.set(true)
+                    result = client.requestAuthorization()
+                }
+                lease.cancellation.throwIfCancelled()
+                val authorized = result.category == "adb_authorization_connected"
+                recordObservation(app, "startup_authorization", "manual=$manual category=${result.category} ${result.detail.orEmpty()}")
+                if (authorized) {
+                    RequiredAccessChecker.missingShellGrantCommands(app).forEach { command ->
+                        lease.cancellation.throwIfCancelled()
+                        val grant = client.execShell(command, timeoutMs = 10_000)
+                        recordObservation(app, "startup_grant", "command=$command ok=${grant.ok} error=${grant.error.orEmpty()} output=${grant.output.take(500)}")
+                    }
+                }
+                lease.cancellation.throwIfCancelled()
+                publishSnapshot(app, lease, AccessRuntimeSnapshot(!RequiredAccessChecker.hasMissingRequiredAccess(app), authorized))
+            } catch (error: Exception) {
+                recordObservation(app, "startup_error", error.diagnosticDetail())
+                publishSnapshot(app, lease, AccessRuntimeSnapshot(
+                    runCatching { !RequiredAccessChecker.hasMissingRequiredAccess(app) }.getOrDefault(false), false))
+            }
+        }
+        if (!submitted) terminal()
+    }
+
     fun request(
         context: Context,
         store: TelemetryStore,

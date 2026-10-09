@@ -129,6 +129,52 @@ class InfluxExportCoordinatorTest {
     }
 
     @Test
+    fun invalidVehicleTagBlocksExportButNotEndpointConnectionTest() {
+        for (vehicleId in listOf("car\r", "car\n", "car\u0000")) {
+            val store = FakeInfluxStore(listOf(row(10, "soc")))
+            val client = FakeInfluxClient()
+            var liveConfig = config(vehicleId = vehicleId)
+            val coordinator = InfluxExportCoordinator(store, client, { liveConfig }, FakeClock())
+
+            assertTrue(coordinator.testConnection().ok)
+            assertEquals(1, client.testCalls)
+            val result = coordinator.startExport()
+            assertFalse(result.ok)
+            assertFalse(result.retryable)
+            assertEquals("influx_vehicle_id_invalid", result.category)
+            assertEquals(InfluxFailureKind.PROTOCOL, result.failureKind)
+            assertTrue(client.writtenLines.isEmpty())
+            assertEquals(0, store.ensureCalls)
+            assertEquals(0L, store.cursor("soc").lastExportedHistoryId)
+
+            liveConfig = liveConfig.copy(vehicleId = "corrected-car")
+            assertTrue(coordinator.startExport().ok)
+            assertTrue(client.writtenLines.single().single().contains("vehicle=corrected-car"))
+        }
+    }
+
+    @Test
+    fun vehicleTagIsFrozenForEachExportSessionAndReplacedAfterEnd() {
+        val store = FakeInfluxStore(listOf(row(10, "soc")))
+        val client = FakeInfluxClient()
+        var liveConfig = config(vehicleId = "first car")
+        val coordinator = InfluxExportCoordinator(store, client, { liveConfig }, FakeClock())
+
+        assertTrue(coordinator.runOneCycle(force = true).ok)
+        assertTrue(client.writtenLines.single().single().contains("vehicle=first\\ car"))
+
+        liveConfig = liveConfig.copy(vehicleId = "changed,car")
+        store.addRow(row(11, "soc"))
+        assertTrue(coordinator.runOneCycle(force = true).ok)
+        assertTrue(client.writtenLines[1].single().contains("vehicle=first\\ car"))
+
+        coordinator.endSession()
+        store.addRow(row(12, "soc"))
+        assertTrue(coordinator.runOneCycle(force = true).ok)
+        assertTrue(client.writtenLines[2].single().contains("vehicle=changed\\,car"))
+    }
+
+    @Test
     fun staleServiceOwnershipCannotEnterCycleStartOrResume() {
         val store = FakeInfluxStore(listOf(row(10, "soc")))
         val client = FakeInfluxClient()
@@ -1202,7 +1248,8 @@ class InfluxExportCoordinatorTest {
 
     private fun config(
         alternativeHost: String? = null,
-        alternativePort: Int? = null
+        alternativePort: Int? = null,
+        vehicleId: String = InfluxConfig.DEFAULT_VEHICLE_ID
     ): InfluxConfig = InfluxConfig(
         enabled = true,
         host = "influx.local",
@@ -1213,7 +1260,8 @@ class InfluxExportCoordinatorTest {
         measurement = "byd_state",
         enabledCategories = setOf("battery"),
         alternativeHost = alternativeHost,
-        alternativePort = alternativePort
+        alternativePort = alternativePort,
+        vehicleId = vehicleId
     )
 
     private fun row(id: Long, fieldKey: String): InfluxPendingHistoryRow = InfluxPendingHistoryRow(

@@ -73,6 +73,7 @@ class RuntimePreferences private constructor(private val context: Context) : Sha
 
     companion object {
         @Volatile private var client: RuntimePreferences? = null
+        fun isInitialized(): Boolean = client != null
         fun get(context: Context): SharedPreferences {
             if (!BuildConfig.RUNTIME_CLIENT) return context.getSharedPreferences(CollectorSettings.PREFS_NAME, Context.MODE_PRIVATE)
             return client ?: synchronized(this) {
@@ -94,36 +95,38 @@ class RuntimePreferences private constructor(private val context: Context) : Sha
             }
         }
 
-        fun editOwner(preferences: SharedPreferences, arguments: Bundle): Bundle {
+        fun editOwner(context: Context, preferences: SharedPreferences, arguments: Bundle): Bundle {
             val changes = arguments.getBundle("changes") ?: Bundle()
             val removals = arguments.getStringArrayList("remove").orEmpty()
-            require(changes.size() + removals.size <= 256) { "Too many setting changes" }
-            val keyPattern = Regex("[a-zA-Z0-9_.-]{1,160}")
-            require((changes.keySet() + removals).all(keyPattern::matches)) { "Invalid setting key" }
-            var characters = 0
-            val editor = preferences.edit()
-            removals.forEach(editor::remove)
-            changes.keySet().forEach { key ->
-                @Suppress("DEPRECATION") val value = changes.get(key)
-                when (value) {
-                    is String -> { characters += value.length; editor.putString(key, value) }
-                    is Boolean -> editor.putBoolean(key, value)
-                    is Int -> editor.putInt(key, value)
-                    is Long -> editor.putLong(key, value)
-                    is Float -> { require(value.isFinite()); editor.putFloat(key, value) }
-                    is ArrayList<*> -> {
-                        require(value.size <= 128 && value.all { it is String })
-                        val strings = value.filterIsInstance<String>().toSet()
-                        characters += strings.sumOf { it.length }
-                        editor.putStringSet(key, strings)
+            return RuntimeJobsService.withMqttConfigurationEdit(context, changes.keySet() + removals) {
+                require(changes.size() + removals.size <= 256) { "Too many setting changes" }
+                val keyPattern = Regex("[a-zA-Z0-9_.-]{1,160}")
+                require((changes.keySet() + removals).all(keyPattern::matches)) { "Invalid setting key" }
+                var characters = 0
+                val editor = preferences.edit()
+                removals.forEach(editor::remove)
+                changes.keySet().forEach { key ->
+                    @Suppress("DEPRECATION") val value = changes.get(key)
+                    when (value) {
+                        is String -> { characters += value.length; editor.putString(key, value) }
+                        is Boolean -> editor.putBoolean(key, value)
+                        is Int -> editor.putInt(key, value)
+                        is Long -> editor.putLong(key, value)
+                        is Float -> { require(value.isFinite()); editor.putFloat(key, value) }
+                        is ArrayList<*> -> {
+                            require(value.size <= 128 && value.all { it is String })
+                            val strings = value.filterIsInstance<String>().toSet()
+                            characters += strings.sumOf { it.length }
+                            editor.putStringSet(key, strings)
+                        }
+                        else -> error("Unsupported setting type")
                     }
-                    else -> error("Unsupported setting type")
                 }
-            }
-            require(characters <= 128 * 1024) { "Settings payload is too large" }
-            return Bundle().apply {
-                putBoolean("committed", editor.commit())
-                putBundle("values", snapshot(preferences))
+                require(characters <= 128 * 1024) { "Settings payload is too large" }
+                Bundle().apply {
+                    putBoolean("committed", editor.commit())
+                    putBundle("values", snapshot(preferences))
+                }
             }
         }
     }

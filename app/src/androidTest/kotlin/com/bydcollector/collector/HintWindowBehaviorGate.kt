@@ -46,8 +46,19 @@ internal object HintWindowBehaviorGate {
                 delegate("updateRuntime").set(app, lazy { UpdateRuntime(app) })
                 check(mainDisplayForUpdateHintIfReady(app) != null) { "Emulator display must be ON" }
                 app.updateRuntime.start("hint_window_fixture")
+            }
+            shell(instrumentation, "input keyevent 223")
+            val sleepDeadline = SystemClock.elapsedRealtime() + 5_000L
+            while (SystemClock.elapsedRealtime() < sleepDeadline && mainDisplayForUpdateHintIfReady(app) != null) {
+                SystemClock.sleep(25L)
+            }
+            onMain(instrumentation) {
+                check(mainDisplayForUpdateHintIfReady(app) == null) { "Emulator did not enter sleep" }
                 check(session.request(manual = true))
             }
+            instrumentation.waitForIdleSync()
+            onMain(instrumentation) { check(attemptTimes.isEmpty()) { "Hint attempted on an unready display" } }
+            shell(instrumentation, "input keyevent 224")
             val deadline = SystemClock.elapsedRealtime() + 15_000L
             while (SystemClock.elapsedRealtime() < deadline &&
                 !onMain(instrumentation) { UpdateHintCoordinator.ownSnapshot().phase == UpdateHintPhase.VISIBLE }) {
@@ -67,9 +78,10 @@ internal object HintWindowBehaviorGate {
                 app.updateRuntime.onPresentationAccessChanged()
                 check(UpdateHintCoordinator.ownSnapshot().phase == UpdateHintPhase.NONE)
                 check(attemptTimes.size == 3) { "Already drawn result was replayed" }
-                "HINT_WINDOW_GATE_PASS attempts=3 retry_gaps_ms=$gaps checks=$checks first_draw=true"
+                "HINT_WINDOW_GATE_PASS deferred_display=true attempts=3 retry_gaps_ms=$gaps checks=$checks first_draw=true"
             }
         } finally {
+            shell(instrumentation, "input keyevent 224")
             onMain(instrumentation) {
                 runCatching { app.updateRuntime.shutdown() }
                 delegates.forEach { (field, value) -> field.set(app, value) }
@@ -78,6 +90,11 @@ internal object HintWindowBehaviorGate {
             previous.forEach { (key, value) -> if (value == null) restore.remove(key) else restore.putBoolean(key, value) }
             check(restore.commit())
         }
+    }
+
+    private fun shell(instrumentation: Instrumentation, command: String) {
+        android.os.ParcelFileDescriptor.AutoCloseInputStream(instrumentation.uiAutomation.executeShellCommand(command))
+            .use { it.copyTo(java.io.ByteArrayOutputStream()) }
     }
 
     private fun <T> onMain(instrumentation: Instrumentation, action: () -> T): T {

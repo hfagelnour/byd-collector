@@ -13,6 +13,10 @@ data class HaMqttConfig(
     val clientId: String,
     val topicPrefix: String,
     val discoveryPrefix: String,
+    val deviceId: String = HaDiscoveryBuilder.DEVICE_ID,
+    val deviceIdentifier: String = HaDiscoveryBuilder.DEVICE_IDENTIFIER,
+    val deviceName: String = HaDiscoveryBuilder.DEVICE_NAME,
+    val deviceModel: String = HaDiscoveryBuilder.DEVICE_MODEL,
     val enabledCategories: Set<String>,
     /** Optional alternative host; a non-blank host requires [alternativePort]. */
     val alternativeHost: String? = null,
@@ -64,6 +68,9 @@ data class HaMqttConfig(
     }
 
     fun isCategoryEnabled(category: String): Boolean = enabledCategories.contains(category)
+    fun normalizedDeviceId(): String = deviceId.ifBlank { HaDiscoveryBuilder.DEVICE_ID }
+    fun validateIdentity(): String? = if (isValidDeviceId(deviceId)) null else
+        "MQTT Device ID must contain only A-Z, a-z, 0-9, underscore or hyphen"
     fun normalizedTopicPrefix(): String = topicPrefix.trim('/').ifBlank { DEFAULT_TOPIC_PREFIX }
     fun normalizedDiscoveryPrefix(): String = discoveryPrefix.trim('/').ifBlank { DEFAULT_DISCOVERY_PREFIX }
 
@@ -73,6 +80,9 @@ data class HaMqttConfig(
         const val DEFAULT_CLIENT_ID = "bydcollector_sealion_07"
         val DEFAULT_CATEGORIES = HaIntegrationCategories.defaults
         val VISIBLE_CATEGORIES = HaIntegrationCategories.visible.toSet()
+        private val DEVICE_ID_PATTERN = Regex("[a-zA-Z0-9_-]+")
+
+        fun isValidDeviceId(value: String): Boolean = value.isBlank() || DEVICE_ID_PATTERN.matches(value)
 
         private fun isValidHost(host: String): Boolean {
             return host.isNotBlank() && host == host.trim() && host.none { it.isWhitespace() || it == '/' || it == '\\' }

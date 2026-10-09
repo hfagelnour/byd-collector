@@ -47,6 +47,8 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
         )
     }
     private var wakeReceiver: BroadcastReceiver? = null
+    private var displayObserver: DisplayManager.DisplayListener? = null
+    private var lastDisplayState: Int? = null
     var ownUiVisible = false
         private set
     private val timer = Runnable { applyAction(UpdateAutoCheckRuntime.onTimerElapsed(enabled(), ownUiVisible)) }
@@ -68,7 +70,7 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
 
     // Explicit normal entry points call this; a coordination-only service bind does not.
     fun start(source: String) {
-        if (BuildConfig.RUNTIME_CLIENT) { RuntimeClient.control("updateStart"); return }
+        if (BuildConfig.RUNTIME_CLIENT) { RuntimeClient.controlAsync("updateStart"); return }
         if (settings.isUserShutdownRequested()) return
         val firstEntry = !started
         val wasSleeping = wakePolicy.sleeping
@@ -87,8 +89,11 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
     }
 
     /** BootReceiver forwards real boot/wake signals even when recovery reuses a live service. */
-    fun onSystemWake(action: String) {
-        if (settings.isUserShutdownRequested()) return
+    fun onSystemWake(action: String, source: String = action) {
+        if (settings.isUserShutdownRequested()) {
+            recordWakeSignal(source, "skip_shutdown")
+            return
+        }
         if (!started) {
             start("wake:$action")
             return
@@ -97,15 +102,21 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
             if (!wakePolicy.sleeping) pauseForSleep()
             return
         }
-        if (wakePolicy.onWake(action, SystemClock.elapsedRealtime())) restartAfterWake(action)
+        val newWake = wakePolicy.onWake(action, SystemClock.elapsedRealtime())
+        if (newWake) restartAfterWake(source)
+        recordWakeSignal(source, if (newWake) "restart_schedule" else "reconcile_presentation")
+        presentPendingHint()
     }
 
     private fun observeWake() {
+        observeDisplay()
         if (wakeReceiver != null) return
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
-                if (intent.action == Intent.ACTION_SCREEN_OFF) pauseForSleep()
-                else intent.action?.let(::onSystemWake)
+                if (intent.action == Intent.ACTION_SCREEN_OFF) {
+                    if (!wakePolicy.sleeping) pauseForSleep()
+                    recordWakeSignal(Intent.ACTION_SCREEN_OFF, "sleep")
+                } else intent.action?.let { onSystemWake(it) }
             }
         }
         val filter = IntentFilter().apply {
@@ -120,6 +131,46 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
         } catch (error: RuntimeException) {
             app.recordUpdateEvent("wake_observer_failed", error::class.java.simpleName)
         }
+    }
+
+    private fun observeDisplay() {
+        if (displayObserver != null) return
+        val manager = app.getSystemService(DisplayManager::class.java) ?: return
+        val observer = object : DisplayManager.DisplayListener {
+            override fun onDisplayAdded(displayId: Int) = onDisplayChanged(displayId)
+            override fun onDisplayRemoved(displayId: Int) = onDisplayChanged(displayId)
+            override fun onDisplayChanged(displayId: Int) {
+                if (!started || displayId != Display.DEFAULT_DISPLAY) return
+                val state = manager.getDisplay(displayId)?.state
+                if (state == lastDisplayState) return
+                lastDisplayState = state
+                if (isUpdateHintDisplayReady(isInteractive(), state)) {
+                    onSystemWake(Intent.ACTION_SCREEN_ON, "display")
+                } else {
+                    if (state == Display.STATE_OFF && !wakePolicy.sleeping) pauseForSleep()
+                    cancelHintPresentation("display_not_ready")
+                    recordWakeSignal("display", "defer_display_not_ready")
+                }
+            }
+        }
+        try {
+            lastDisplayState = manager.getDisplay(Display.DEFAULT_DISPLAY)?.state
+            manager.registerDisplayListener(observer, handler)
+            displayObserver = observer
+        } catch (error: RuntimeException) {
+            app.recordUpdateEvent("display_observer_failed", error::class.java.simpleName)
+        }
+    }
+
+    private fun recordWakeSignal(source: String, decision: String) {
+        val displayState = app.getSystemService(DisplayManager::class.java)?.getDisplay(Display.DEFAULT_DISPLAY)?.state
+        val resultId = app.updateChecks.snapshot().availableResultId
+        app.recordUpdateEvent("wake_presentation", "source=$source elapsed_ms=${SystemClock.elapsedRealtime()} " +
+            "display=$displayState interactive=${isInteractive()} sleeping=${wakePolicy.sleeping} " +
+            "shutdown=${settings.isUserShutdownRequested()} visible=$ownUiVisible installing=$installing " +
+            "hint_enabled=${settings.isUpdateHintEnabled()} overlay=${canDrawUpdateHints()} " +
+            "result_id=$resultId eligible=${resultId?.let(::canCreateHint) == true} " +
+            "active_result=${app.updateHints.activeResultId} decision=$decision")
     }
 
     private fun isInteractive(): Boolean = app.getSystemService(PowerManager::class.java)?.isInteractive != false
@@ -163,19 +214,19 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
     }
 
     fun onUiResumed() {
-        if (BuildConfig.RUNTIME_CLIENT) { RuntimeClient.control("updateResume"); return }
+        if (BuildConfig.RUNTIME_CLIENT) { RuntimeClient.controlAsync("updateResume"); return }
         if (awaitingInstallerReturn) onInstallFinished()
         presentPendingHint()
     }
 
     /** Reuses the cached result after permission/lifecycle changes; no HTTP check. */
     fun onPresentationAccessChanged() {
-        if (BuildConfig.RUNTIME_CLIENT) { RuntimeClient.control("updateAccess"); return }
+        if (BuildConfig.RUNTIME_CLIENT) { RuntimeClient.controlAsync("updateAccess"); return }
         presentPendingHint()
     }
 
     fun onOfferPresented(resultId: Long) {
-        if (BuildConfig.RUNTIME_CLIENT) { RuntimeClient.control("offer", Bundle().apply { putLong("result", resultId) }); return }
+        if (BuildConfig.RUNTIME_CLIENT) { RuntimeClient.controlAsync("offer", Bundle().apply { putLong("result", resultId) }); return }
         if (!ownUiVisible || !started || installing || wakePolicy.sleeping || settings.isUserShutdownRequested()) return
         val snapshot = app.updateChecks.snapshot()
         if (presentation.markPresented(snapshot, resultId)) {
@@ -189,7 +240,9 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
             hintCreationRetry.cancelAttempt(resultId, attemptToken, "presentation_rejected")
             return false
         }
-        return presentation.markPresented(app.updateChecks.snapshot(), resultId)
+        return presentation.markPresented(app.updateChecks.snapshot(), resultId).also { shown ->
+            if (shown) hintCreationRetry.onPresented(resultId, attemptToken)
+        }
     }
 
     fun canAttachHint(resultId: Long, attemptToken: Long): Boolean =
@@ -290,6 +343,12 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
                 .onFailure { app.recordUpdateEvent("wake_observer_remove_failed", it::class.java.simpleName) }
         }
         wakeReceiver = null
+        displayObserver?.let { observer ->
+            runCatching { app.getSystemService(DisplayManager::class.java)?.unregisterDisplayListener(observer) }
+                .onFailure { app.recordUpdateEvent("display_observer_remove_failed", it::class.java.simpleName) }
+        }
+        displayObserver = null
+        lastDisplayState = null
         wakePolicy.reset()
     }
 

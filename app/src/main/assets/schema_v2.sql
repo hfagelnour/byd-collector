@@ -280,7 +280,8 @@ CREATE TABLE IF NOT EXISTS mqtt_outbox (
     attempt_count INTEGER NOT NULL DEFAULT 0,
     last_attempt_at TEXT,
     last_error_at TEXT,
-    last_error TEXT
+    last_error TEXT,
+    destination_key TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_mqtt_outbox_due

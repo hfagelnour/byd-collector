@@ -5527,7 +5527,8 @@ class CollectorService : Service() {
                 normalizedProvider = store,
                 configProvider = { settings.mqttConfig() }
             ),
-            configProvider = { settings.mqttConfig() }
+            configProvider = { settings.mqttConfig() },
+            publicationJournal = (applicationContext as BydCollectorApplication).mqttPublicationJournal
         )
     }
 

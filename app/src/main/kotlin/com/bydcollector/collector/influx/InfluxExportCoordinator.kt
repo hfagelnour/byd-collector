@@ -407,6 +407,13 @@ class InfluxExportCoordinator(
                 failureKind = InfluxFailureKind.PROTOCOL
             )
         }
+        config.validateVehicleId()?.let {
+            return InfluxActionResult.fail(
+                "influx_vehicle_id_invalid",
+                it,
+                failureKind = InfluxFailureKind.PROTOCOL
+            )
+        }
         if (config.normalizedDatabase().isBlank()) return InfluxActionResult.fail("influx_database_missing", "InfluxDB database is blank")
         return null
     }

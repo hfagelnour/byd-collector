@@ -18,6 +18,9 @@ import com.bydcollector.collector.data.debug.DirectDebugDatabaseResolver
 import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import com.bydcollector.collector.data.trips.TripDatabaseHelper
 import com.bydcollector.collector.mqtt.HaMqttActions
+import com.bydcollector.collector.mqtt.HaMqttConfig
+import com.bydcollector.collector.mqtt.MqttCleanupCore
+import com.bydcollector.collector.mqtt.MqttCleanupSelection
 import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.update.UpdateApkVerifier
@@ -125,6 +128,23 @@ class RuntimeJobsService : Service() {
                     JSONObject().put("ok", it.ok).put("message", it.message)
                 }
             }
+            "mqttCleanup" -> {
+                val selection = parseCleanupSelection(args)
+                val settings = CollectorSettings(this)
+                val execution = MqttCleanupCore(
+                    journal = app.mqttPublicationJournal,
+                    configProvider = { settings.mqttConfig() }
+                ).execute(selection) {
+                    Thread.currentThread().isInterrupted || settings.isUserShutdownRequested()
+                }
+                check(execution.result.ok) { "${execution.result.category}: ${execution.result.message}" }
+                JSONObject()
+                    .put("jobId", job.getString("id"))
+                    .put("deviceId", selection.deviceId)
+                    .put("fingerprint", selection.fingerprint)
+                    .put("operationId", checkNotNull(execution.operationId))
+                    .put("acknowledged", true)
+            }
             "influxTest" -> app.withTelemetryStoreRead { store ->
                 InfluxActions.testConnection(store, CollectorSettings(this, store),
                     profile = HaEndpointProfile.valueOf(args.getString("profile"))).let {
@@ -203,8 +223,25 @@ class RuntimeJobsService : Service() {
         private const val CHANNEL = "runtime_jobs"
         private val LOCK = Any()
         private var cached: MutableList<JSONObject>? = null
+        private val mqttConfigurationKeys = setOf(
+            CollectorSettings.KEY_MQTT_HOST,
+            CollectorSettings.KEY_MQTT_PORT,
+            CollectorSettings.KEY_MQTT_ALTERNATIVE_HOST,
+            CollectorSettings.KEY_MQTT_ALTERNATIVE_PORT,
+            CollectorSettings.KEY_MQTT_USERNAME,
+            CollectorSettings.KEY_MQTT_PASSWORD,
+            CollectorSettings.KEY_MQTT_CLIENT_ID,
+            CollectorSettings.KEY_MQTT_TOPIC_PREFIX,
+            CollectorSettings.KEY_MQTT_DISCOVERY_PREFIX,
+            CollectorSettings.KEY_MQTT_DEVICE_ID,
+            CollectorSettings.KEY_MQTT_DEVICE_IDENTIFIER,
+            CollectorSettings.KEY_MQTT_DEVICE_NAME,
+            CollectorSettings.KEY_MQTT_DEVICE_MODEL,
+            CollectorSettings.SECRET_MQTT_USERNAME,
+            CollectorSettings.SECRET_MQTT_PASSWORD
+        )
         private fun lane(kind: String) = when { kind.startsWith("log") || kind == "archiveShare" -> "diagnostics"; kind.endsWith("Test") -> "tests"; else -> kind }
-        private val accepted = setOf("access", "mqttTest", "influxTest", "logStart", "logStop", "logShare", "logClear", "archiveShare", "updateDownload")
+        private val accepted = setOf("access", "mqttTest", "mqttCleanup", "influxTest", "logStart", "logStop", "logShare", "logClear", "archiveShare", "updateDownload")
 
         fun recover(context: Context) {
             if (CollectorSettings(context).isUserShutdownRequested()) return
@@ -218,6 +255,7 @@ class RuntimeJobsService : Service() {
         fun submit(context: Context, kind: String, args: JSONObject): String = synchronized(LOCK) {
             require(kind in accepted && args.toString().length <= 64 * 1024) { "Invalid background job" }
             check(!CollectorSettings(context).isUserShutdownRequested()) { "Shutdown requested" }
+            val requestedCleanup = if (kind == "mqttCleanup") parseCleanupSelection(args) else null
             if (kind == "mqttTest" || kind == "influxTest") HaEndpointProfile.valueOf(args.getString("profile"))
             if (kind == "access") {
                 com.bydcollector.collector.adb.AccessCheckMode.valueOf(args.getString("mode"))
@@ -229,6 +267,15 @@ class RuntimeJobsService : Service() {
                 (0 until ids.length()).forEach { require(ids.getString(it).length in 1..512) }
             }
             val all = load(context)
+            if (requestedCleanup != null) {
+                all.firstOrNull { it.getString("kind") == kind && it.getString("status") in setOf("queued", "running") }
+                    ?.let { active ->
+                        check(parseCleanupSelection(active.getJSONObject("args")) == requestedCleanup) {
+                            "A different MQTT cleanup is already queued or running"
+                        }
+                        return active.getString("id")
+                    }
+            }
             all.firstOrNull { it.getString("kind") == kind && it.getString("status") in setOf("queued", "running") }
                 ?.let { return it.getString("id") }
             check(all.count { it.getString("status") in setOf("queued", "running") } < 16) { "Background task queue is full" }
@@ -242,6 +289,33 @@ class RuntimeJobsService : Service() {
                 throw error
             }
             id
+        }
+
+        fun <T> withMqttConfigurationEdit(context: Context, keys: Set<String>, action: () -> T): T {
+            if (keys.none(mqttConfigurationKeys::contains)) return action()
+            return synchronized(LOCK) {
+                val cleanupActive = load(context).any {
+                    it.optString("kind") == "mqttCleanup" && it.optString("status") in setOf("queued", "running")
+                }
+                check(!cleanupActive) { "MQTT destination settings cannot change while cleanup is queued or running" }
+                action()
+            }
+        }
+
+        private fun parseCleanupSelection(args: JSONObject): MqttCleanupSelection {
+            require(args.length() == 2 && args.has("deviceId") && args.has("fingerprint")) {
+                "MQTT cleanup requires only a Device ID and selection fingerprint"
+            }
+            require(args.opt("deviceId") is String && args.opt("fingerprint") is String) {
+                "Invalid MQTT cleanup selection"
+            }
+            val deviceId = args.getString("deviceId")
+            val fingerprint = args.getString("fingerprint")
+            require(deviceId.isNotBlank() && HaMqttConfig.isValidDeviceId(deviceId)) {
+                "Invalid MQTT cleanup Device ID"
+            }
+            require(fingerprint.matches(Regex("[a-f0-9]{64}"))) { "Invalid MQTT cleanup selection fingerprint" }
+            return MqttCleanupSelection(deviceId, fingerprint)
         }
 
         fun snapshot(context: Context): String = synchronized(LOCK) {

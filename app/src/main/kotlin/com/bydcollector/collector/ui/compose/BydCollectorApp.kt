@@ -11,6 +11,7 @@ import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
@@ -58,6 +59,7 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -88,6 +90,9 @@ import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.viewinterop.AndroidView
 import com.bydcollector.collector.R
 import com.bydcollector.collector.ha.HaEndpointProfile
+import com.bydcollector.collector.mqtt.HaMqttConfig
+import com.bydcollector.collector.mqtt.MqttCleanupGroup
+import com.bydcollector.collector.mqtt.MqttCleanupSelection
 import com.bydcollector.collector.maintenance.ArchiveEntryStatus
 import com.bydcollector.collector.maintenance.ArchiveStorageSnapshot
 import com.bydcollector.collector.maintenance.ArchiveStorageItemState
@@ -152,6 +157,7 @@ fun BydCollectorApp(
     databaseMaintenanceUiState: DbMaintenanceUiState? = null,
     diagnosticsBusy: Boolean = false,
     actionUiState: BydCollectorActionUiState = BydCollectorActionUiState(),
+    mqttCleanupUiState: MqttCleanupUiState = MqttCleanupUiState(),
     actions: BydCollectorActions,
     backgroundSetupPromptVisible: Boolean = false,
     onOpenBackgroundSettingsFromPrompt: () -> Unit = {},
@@ -165,6 +171,7 @@ fun BydCollectorApp(
         var showClearLogsDialog by remember { mutableStateOf(false) }
         var showUpdateHintSettings by remember { mutableStateOf(false) }
         var showSupportDialog by rememberSaveable { mutableStateOf(false) }
+        var showMqttCleanup by remember { mutableStateOf(false) }
         var showTripsCompressionConfirm by remember { mutableStateOf(false) }
         val tripsCompression by TripCompressionService.state.collectAsStateWithLifecycle()
         LaunchedEffect(updateUiState) {
@@ -223,7 +230,11 @@ fun BydCollectorApp(
                                      actions,
                                      actionUiState,
                                      navigationSession,
-                                     tabContentReady
+                                     tabContentReady,
+                                     onOpenCleanup = {
+                                         showMqttCleanup = true
+                                         actions.onRefreshMqttCleanup()
+                                     }
                                  )
                                 AppTab.TELEGRAM -> TelegramTab(s, telegramUiState, telegramActions, navigationSession)
                                  AppTab.STORAGE -> StorageTab(
@@ -253,6 +264,11 @@ fun BydCollectorApp(
                         }
                     }
                     BottomTabs(activeTab = activeTab, strings = s, actions = actions)
+                }
+                if (showMqttCleanup) {
+                    MqttCleanupDialog(s, mqttCleanupUiState, actionUiState.mqttCleanup,
+                        actions::onCleanupMqttIdentity, actions::onRefreshMqttCleanup,
+                        onDismiss = { showMqttCleanup = false })
                 }
                 if (backgroundSetupPromptVisible) {
                     //blocks underlying controls while the dilink background-app instruction is visible
@@ -342,7 +358,7 @@ fun BydCollectorApp(
 }
 
 @Composable
-private fun BackgroundAppsSetupPrompt(
+internal fun BackgroundAppsSetupPrompt(
     strings: UiStrings,
     onOpenSettings: () -> Unit,
     onDismiss: () -> Unit
@@ -1755,8 +1771,11 @@ private fun HaTab(
     actions: BydCollectorActions,
     actionUiState: BydCollectorActionUiState,
     session: UiSessionState,
-    contentReady: Boolean
+    contentReady: Boolean,
+    onOpenCleanup: () -> Unit
 ) {
+    var mqttCredentialHeight by remember { mutableStateOf(0) }
+    val credentialMinHeight = with(LocalDensity.current) { mqttCredentialHeight.toDp() }
     TabScrollColumn(AppTab.HA, session, contentReady) {
         Row(Modifier.fillMaxWidth().height(36.dp), verticalAlignment = Alignment.CenterVertically) {
             ScreenTitle(strings.haTab, strings.haSubtitle, modifier = Modifier.weight(1f))
@@ -1769,9 +1788,122 @@ private fun HaTab(
             }
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            MqttCard(state, strings, mqttDraft, actions, actionUiState, Modifier.weight(1f))
-            InfluxCard(state, strings, influxDraft, actions, actionUiState, Modifier.weight(1f))
+            MqttCard(state, strings, mqttDraft, actions, actionUiState, Modifier.weight(1f),
+                onOpenCleanup, { mqttCredentialHeight = it })
+            InfluxCard(state, strings, influxDraft, actions, actionUiState, Modifier.weight(1f), credentialMinHeight)
         }
+    }
+}
+
+@Composable
+private fun MqttCleanupDialog(
+    strings: UiStrings,
+    state: MqttCleanupUiState,
+    running: Boolean,
+    onConfirm: (MqttCleanupSelection) -> Unit,
+    onRefresh: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val p = LocalBydPalette.current
+    var selected by remember { mutableStateOf<MqttCleanupGroup?>(null) }
+    val dismiss = { if (selected != null) selected = null else onDismiss() }
+    Dialog(onDismissRequest = dismiss,
+        properties = DialogProperties(dismissOnClickOutside = false, usePlatformDefaultWidth = false)) {
+        Box(Modifier.fillMaxSize().background(p.background.copy(alpha = 0.82f)), contentAlignment = Alignment.Center) {
+            ModalInputBlocker()
+            Column(Modifier.widthIn(max = 760.dp).fillMaxWidth(0.90f)
+                .background(p.panel, Rounded8).border(1.dp, p.border, Rounded8).padding(18.dp)
+                .heightIn(max = 520.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                val confirmation = selected
+                Text(if (confirmation == null) strings.haIdentity.mqttCleanupTitle else strings.haIdentity.mqttCleanupConfirm,
+                    color = p.text, fontSize = 19.sp, fontWeight = FontWeight.SemiBold)
+                Text(strings.haIdentity.mqttCleanupScope, color = p.muted, fontSize = 12.sp)
+                if (running) Text(strings.haIdentity.mqttCleanupRunning, color = p.yellow, fontSize = 12.sp)
+                if (confirmation == null) {
+                    val singleCurrent = state.groups.singleOrNull()?.current == true
+                    if (state.loading && !singleCurrent) Text(strings.loading, color = p.muted, fontSize = 13.sp)
+                    state.error?.let { Text(it, color = p.red, fontSize = 13.sp) }
+                    Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        if (!state.loading && state.error == null && state.groups.isEmpty()) {
+                            Text(strings.haIdentity.mqttCleanupEmpty, color = p.muted, fontSize = 13.sp)
+                        }
+                        state.groups.forEach { group ->
+                            key(group.deviceId) {
+                                Row(Modifier.fillMaxWidth().heightIn(min = 64.dp)
+                                    .border(1.dp, p.border, ControlShape).padding(10.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text(group.identityLine(), modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                            color = p.text, fontSize = 13.sp, fontFamily = FontFamily.Monospace, maxLines = 1)
+                                        if (singleCurrent) {
+                                            // Keep one metadata line from the first frame; additional IDs may expand the modal.
+                                            Text(buildAnnotatedString {
+                                                append(when (group.state) {
+                                                    "loading" -> strings.loading
+                                                    "no_history" -> strings.haIdentity.mqttCleanupEmpty
+                                                    else -> "${strings.haIdentity.mqttCleanupTopics}: ${group.topicCount}"
+                                                })
+                                                if (group.uncertainCount > 0) withStyle(SpanStyle(color = p.yellow)) {
+                                                    append(" | ${strings.haIdentity.mqttCleanupUnknown}: ${group.uncertainCount}")
+                                                }
+                                            }, modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                                color = p.muted, fontSize = 12.sp, minLines = 1, maxLines = 1)
+                                        } else {
+                                            if (group.state != "loading") Text(if (group.state == "no_history") strings.haIdentity.mqttCleanupEmpty
+                                                else "${strings.haIdentity.mqttCleanupTopics}: ${group.topicCount}", color = p.muted, fontSize = 12.sp)
+                                            if (group.uncertainCount > 0) Text("${strings.haIdentity.mqttCleanupUnknown}: ${group.uncertainCount}", color = p.yellow, fontSize = 12.sp)
+                                        }
+                                        if (group.current) Text(strings.haIdentity.mqttCleanupCurrent, color = p.green, fontSize = 12.sp)
+                                        group.error?.let { Text(it, color = p.red, fontSize = 12.sp) }
+                                    }
+                                    MqttIdentityDeleteButton("${strings.haIdentity.mqttCleanupDelete}: ${group.deviceId}",
+                                        enabled = !group.current && !running && !state.loading && state.error == null,
+                                        onClick = { selected = group })
+                                }
+                            }
+                        }
+                    }
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        ActionButton(strings.haIdentity.mqttCleanupRefresh, onRefresh, Modifier.weight(1f), enabled = !state.loading)
+                        ActionButton(strings.close, dismiss, Modifier.weight(1f))
+                    }
+                } else {
+                    Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                        Text(confirmation.identityLine(), modifier = Modifier.horizontalScroll(rememberScrollState()),
+                            color = p.text, fontSize = 13.sp, fontFamily = FontFamily.Monospace, maxLines = 1)
+                        Text("${strings.haIdentity.mqttCleanupTopics}: ${confirmation.topicCount}", color = p.muted, fontSize = 13.sp)
+                        if (confirmation.uncertainCount > 0) Text("${strings.haIdentity.mqttCleanupUnknown}: ${confirmation.uncertainCount}", color = p.yellow, fontSize = 12.sp)
+                        Text(strings.haIdentity.mqttCleanupWarning, color = p.red, fontSize = 13.sp)
+                    }
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        ActionButton(strings.haIdentity.mqttCleanupDelete, {
+                            onConfirm(confirmation.selection)
+                            selected = null
+                        }, Modifier.weight(1f), danger = true,
+                            enabled = !running && !state.loading && state.error == null &&
+                                state.groups.any { it.selection == confirmation.selection && !it.current })
+                        ActionButton(strings.cancel, dismiss, Modifier.weight(1f))
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MqttIdentityDeleteButton(description: String, enabled: Boolean, onClick: () -> Unit) {
+    val p = LocalBydPalette.current
+    val interaction = remember { MutableInteractionSource() }
+    val press = rememberForcedPressClick(enabled, onClick)
+    Box(Modifier.size(42.dp).pressScaleModifier(interaction, enabled, forcePressed = press.visualPressed)
+        .clip(ControlShape).background(if (enabled) p.redSoft.copy(alpha = 0.56f) else Color.Transparent)
+        .border(1.dp, if (enabled) p.red else p.borderStrong, ControlShape)
+        .clickable(enabled = enabled && !press.locked, interactionSource = interaction, indication = null,
+            role = Role.Button, onClick = press.onClick), contentAlignment = Alignment.Center) {
+        DeleteIcon(description, if (enabled) p.red else p.muted, Modifier.size(20.dp))
     }
 }
 
@@ -1782,7 +1914,9 @@ private fun MqttCard(
     draft: MqttDraft,
     actions: BydCollectorActions,
     actionUiState: BydCollectorActionUiState,
-    modifier: Modifier
+    modifier: Modifier,
+    onOpenCleanup: () -> Unit,
+    onCredentialHeight: (Int) -> Unit
 ) {
     val connection by CollectorService.mqttConnection.state.collectAsStateWithLifecycle()
     val controls = ChannelStatusFormatter.controls(state?.mqttRuntimeStatus ?: RuntimeActionStatus.STOPPED,
@@ -1790,7 +1924,7 @@ private fun MqttCard(
     SectionCard(
         title = "MQTT",
         trailing = { StatusPill(compactChannelStatusText(state?.mqttStatus, strings, state?.mqttRuntimeStatus), channelStatusKind(state?.mqttStatus, state?.mqttEnabled == true, state?.mqttRuntimeStatus), compact = true) },
-        modifier = modifier.height(686.dp)
+        modifier = modifier
     ) {
         ChannelButtons(
             strings,
@@ -1800,15 +1934,21 @@ private fun MqttCard(
             runtimeStatus = state?.mqttRuntimeStatus ?: RuntimeActionStatus.STOPPED,
             testInFlight = actionUiState.mqttTest,
             connectionOwned = connection.owned,
-            connectionStopping = connection.stopping
+            connectionStopping = connection.stopping,
+            cleanupInFlight = actionUiState.mqttCleanup
         )
         ChannelQueueRow(strings, "${state?.mqttPendingCount ?: 0L} ${strings.messages}",
             state?.mqttAutoStartEnabled == true, actions::onToggleMqttAutoStart)
         CategoryGrid(strings.mqttCategories, state?.mqttEnabledCategories.orEmpty(), enabled = controls.edit, strings = strings) { category ->
             actions.onToggleMqttCategory(category, !state?.mqttEnabledCategories.orEmpty().contains(category))
         }
-        CredentialGridMqtt(strings, draft, actions, connection.activeRoute, controls.edit)
+        val editIdentity = controls.edit && !actionUiState.mqttCleanup
+        CredentialGridMqtt(strings, draft, actions, connection.activeRoute, editIdentity,
+            Modifier.onGloballyPositioned { onCredentialHeight(it.size.height) })
+        MqttIdentityFields(strings, draft, actions, editIdentity)
         if (connection.owned) Text(strings.stopChannelToEdit, color = LocalBydPalette.current.muted, fontSize = 12.sp)
+        ActionButton(strings.haIdentity.mqttCleanupButton, onOpenCleanup, Modifier.fillMaxWidth())
+        if (actionUiState.mqttCleanup) Text(strings.haIdentity.mqttCleanupRunning, color = LocalBydPalette.current.yellow, fontSize = 12.sp)
     }
 }
 
@@ -1819,7 +1959,8 @@ private fun InfluxCard(
     draft: InfluxDraft,
     actions: BydCollectorActions,
     actionUiState: BydCollectorActionUiState,
-    modifier: Modifier
+    modifier: Modifier,
+    credentialMinHeight: Dp
 ) {
     val connection by CollectorService.influxConnection.state.collectAsStateWithLifecycle()
     val controls = ChannelStatusFormatter.controls(state?.influxRuntimeStatus ?: RuntimeActionStatus.STOPPED,
@@ -1827,7 +1968,7 @@ private fun InfluxCard(
     SectionCard(
         title = "InfluxDB",
         trailing = { StatusPill(compactChannelStatusText(state?.influxStatus, strings, state?.influxRuntimeStatus), channelStatusKind(state?.influxStatus, state?.influxEnabled == true, state?.influxRuntimeStatus), compact = true) },
-        modifier = modifier.height(686.dp)
+        modifier = modifier
     ) {
         ChannelButtons(
             strings,
@@ -1849,7 +1990,14 @@ private fun InfluxCard(
         ) { category ->
             actions.onToggleInfluxCategory(category, !state?.influxEnabledCategories.orEmpty().contains(category))
         }
-        CredentialGridInflux(strings, draft, actions, connection.activeRoute, controls.edit)
+        CredentialGridInflux(strings, draft, actions, connection.activeRoute, controls.edit,
+            Modifier.heightIn(min = credentialMinHeight))
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            TextInput(strings.haIdentity.influxVehicleId, draft.vehicleId,
+                { actions.onInfluxDraftChanged(draft.copy(vehicleId = it)) },
+                Modifier.weight(1f), enabled = controls.edit)
+            Spacer(Modifier.weight(1f))
+        }
         if (connection.owned) Text(strings.stopChannelToEdit, color = LocalBydPalette.current.muted, fontSize = 12.sp)
     }
 }
@@ -1883,7 +2031,8 @@ private fun ChannelButtons(
     runtimeStatus: RuntimeActionStatus,
     testInFlight: Boolean,
     connectionOwned: Boolean = false,
-    connectionStopping: Boolean = false
+    connectionStopping: Boolean = false,
+    cleanupInFlight: Boolean = false
 ) {
     val starting = runtimeStatus == RuntimeActionStatus.STARTING ||
         (connectionOwned && runtimeStatus == RuntimeActionStatus.STOPPED)
@@ -1893,7 +2042,7 @@ private fun ChannelButtons(
             if (starting) strings.starting else strings.start,
             onStart,
             primary = true,
-            enabled = controls.start,
+            enabled = controls.start && !cleanupInFlight,
             modifier = Modifier.weight(1f)
         )
         ActionButton(
@@ -1905,7 +2054,7 @@ private fun ChannelButtons(
         ActionButton(
             if (testInFlight) strings.loading else strings.testConnection,
             onTest,
-            enabled = !testInFlight,
+            enabled = !testInFlight && !cleanupInFlight,
             modifier = Modifier.weight(1f)
         )
     }
@@ -1944,9 +2093,9 @@ private fun CategoryGrid(
 @Composable
 private fun CredentialGridMqtt(
     strings: UiStrings, draft: MqttDraft, actions: BydCollectorActions,
-    activeRoute: HaEndpointProfile?, enabled: Boolean
+    activeRoute: HaEndpointProfile?, enabled: Boolean, modifier: Modifier = Modifier
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
         val alternative = draft.editingProfile == HaEndpointProfile.ALTERNATIVE
         HaEndpointFields(strings, "MQTT", draft.editingProfile, activeRoute, enabled,
             if (alternative) draft.alternativeHost else draft.host,
@@ -1975,6 +2124,24 @@ private fun CredentialGridMqtt(
             TextInput(strings.discoveryPrefix, draft.discoveryPrefix, { actions.onMqttDraftChanged(draft.copy(discoveryPrefix = it)) }, Modifier.weight(1f), enabled = enabled)
             Spacer(Modifier.weight(1f))
         }
+    }
+}
+
+@Composable
+private fun MqttIdentityFields(strings: UiStrings, draft: MqttDraft, actions: BydCollectorActions, enabled: Boolean) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            TextInput(strings.haIdentity.deviceId, draft.deviceId, { actions.onMqttDraftChanged(draft.copy(deviceId = it)) }, Modifier.weight(1f), enabled = enabled)
+            TextInput(strings.haIdentity.deviceIdentifier, draft.deviceIdentifier, { actions.onMqttDraftChanged(draft.copy(deviceIdentifier = it)) }, Modifier.weight(1f), enabled = enabled)
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            TextInput(strings.haIdentity.deviceName, draft.deviceName, { actions.onMqttDraftChanged(draft.copy(deviceName = it)) }, Modifier.weight(1f), enabled = enabled)
+            TextInput(strings.haIdentity.deviceModel, draft.deviceModel, { actions.onMqttDraftChanged(draft.copy(deviceModel = it)) }, Modifier.weight(1f), enabled = enabled)
+        }
+        val validId = HaMqttConfig.isValidDeviceId(draft.deviceId)
+        Text(if (validId) strings.haIdentity.mqttDeviceIdHint else strings.haIdentity.invalidMqttDeviceId,
+            color = if (validId) LocalBydPalette.current.muted else LocalBydPalette.current.red, fontSize = 12.sp)
+        Text(strings.haIdentity.mqttIdentityWarning, color = LocalBydPalette.current.yellow, fontSize = 12.sp)
     }
 }
 
@@ -2021,9 +2188,9 @@ private fun HaEndpointFields(
 @Composable
 private fun CredentialGridInflux(
     strings: UiStrings, draft: InfluxDraft, actions: BydCollectorActions,
-    activeRoute: HaEndpointProfile?, enabled: Boolean
+    activeRoute: HaEndpointProfile?, enabled: Boolean, modifier: Modifier = Modifier
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
         val alternative = draft.editingProfile == HaEndpointProfile.ALTERNATIVE
         HaEndpointFields(strings, "InfluxDB", draft.editingProfile, activeRoute, enabled,
             if (alternative) draft.alternativeHost else draft.host,

@@ -14,8 +14,10 @@ import com.bydcollector.collector.maintenance.ArchiveEntryStatus
 import com.bydcollector.collector.ui.ArchiveStorageSnapshotCache
 import com.bydcollector.collector.maintenance.DatabaseArchiveManager
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
+import com.bydcollector.collector.mqtt.MqttPublicationJournal
 import com.bydcollector.collector.maintenance.StorageFormatCutoverCoordinator
 import com.bydcollector.collector.util.sharedOperationalEventExecutor
+import com.bydcollector.collector.mqtt.HaMqttMessage
 import java.io.File
 import java.security.MessageDigest
 import java.util.concurrent.CountDownLatch
@@ -35,8 +37,146 @@ internal object StorageBehaviorGate {
         "archive_cold_cache_stays_visible_during_zip" to { archiveColdCache(context, prefix) },
         "archive_busy_full_and_create_failure_preserve_evidence" to { archiveFailureSafety(context, prefix) },
         "trip_completion_atomic_close_and_exact_ack" to { tripCompletion(context, prefix) },
-        "telegram_atomic_outbox_state_and_delivery" to { telegramTransactions(context, prefix) }
+        "telegram_atomic_outbox_state_and_delivery" to { telegramTransactions(context, prefix) },
+        "mqtt_outbox_compact_and_legacy_migration" to { mqttOutboxMigration(context, prefix) },
+        "mqtt_publication_journal_reopen_epoch_receipt_and_archive_isolation" to { mqttPublicationJournal(context, prefix) }
     )
+
+    private fun mqttOutboxMigration(context: Context, prefix: String) {
+        fun fixture(compact: Boolean) {
+            val name = "${prefix}_mqtt_outbox_${if (compact) "compact" else "legacy"}_v14.db"
+            val file = context.getDatabasePath(name)
+            check(file.parentFile?.mkdirs() == true || file.parentFile?.isDirectory == true)
+            SQLiteDatabase.openOrCreateDatabase(file, null).use { db ->
+                if (compact) {
+                    db.execSQL("CREATE TABLE storage_meta(schema_family TEXT PRIMARY KEY, format_version INTEGER NOT NULL, created_at_ms INTEGER NOT NULL)")
+                    db.execSQL(
+                        "INSERT INTO storage_meta(schema_family, format_version, created_at_ms) VALUES(?, ?, ?)",
+                        arrayOf(TelemetryDatabaseHelper.SCHEMA_FAMILY, TelemetryDatabaseHelper.FORMAT_VERSION, 1L)
+                    )
+                }
+                //A genuine v14 table definition: all current columns except destination_key.
+                db.execSQL(
+                    """CREATE TABLE mqtt_outbox (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        target_key TEXT NOT NULL UNIQUE,
+                        target_type TEXT NOT NULL,
+                        topic TEXT NOT NULL,
+                        payload TEXT NOT NULL,
+                        payload_hash TEXT NOT NULL,
+                        retained INTEGER NOT NULL CHECK(retained IN (0, 1)),
+                        qos INTEGER NOT NULL,
+                        priority INTEGER NOT NULL DEFAULT 100,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        next_attempt_at TEXT,
+                        attempt_count INTEGER NOT NULL DEFAULT 0,
+                        last_attempt_at TEXT,
+                        last_error_at TEXT,
+                        last_error TEXT
+                    )""".trimIndent()
+                )
+                db.execSQL(
+                    "INSERT INTO mqtt_outbox(target_key,target_type,topic,payload,payload_hash,retained,qos,priority,created_at,updated_at) VALUES(?,?,?,?,?,1,1,10,?,?)",
+                    arrayOf("legacy_topic", "discovery", "ha/device/config", "old", "hash", "created", "updated")
+                )
+                db.version = 14
+            }
+            TelemetryDatabaseHelper(context, file.absolutePath).use { helper ->
+                val db = helper.writableDatabase
+                check(db.version == TelemetryDatabaseHelper.DATABASE_VERSION)
+                check(TelemetryDatabaseHelper.isCompactV2(db) == compact)
+                val columns = db.rawQuery("PRAGMA table_info(mqtt_outbox)", null).use { cursor ->
+                    buildSet { while (cursor.moveToNext()) add(cursor.getString(1)) }
+                }
+                check("destination_key" in columns) { "${if (compact) "Compact" else "Legacy"} v14 migration omitted destination_key" }
+                db.rawQuery("SELECT payload, destination_key FROM mqtt_outbox WHERE target_key = ?", arrayOf("legacy_topic")).use { cursor ->
+                    check(cursor.moveToFirst() && cursor.getString(0) == "old" && cursor.isNull(1)) {
+                        "${if (compact) "Compact" else "Legacy"} v14 outbox row was not preserved as unscoped legacy work"
+                    }
+                }
+            }
+
+            val boundDestination = "destination-${if (compact) "compact" else "legacy"}"
+            TelemetryStore(
+                context,
+                TelemetryDatabaseHelper(context, file.absolutePath),
+                operationalEventJournal = journal(context, prefix)
+            ).use { store ->
+                store.upsertPending(
+                    HaMqttMessage("ha/device/scoped/config", "scoped-payload", retained = true),
+                    targetType = "discovery",
+                    priority = 10,
+                    destinationKey = boundDestination
+                )
+            }
+            TelemetryStore(
+                context,
+                TelemetryDatabaseHelper(context, file.absolutePath),
+                operationalEventJournal = journal(context, prefix)
+            ).use { reopened ->
+                val pending = reopened.pendingMessages(limit = 10).single { it.targetKey == "ha/device/scoped/config" }
+                check(pending.destinationKey == boundDestination && pending.message.payload == "scoped-payload") {
+                    "${if (compact) "Compact" else "Legacy"} outbox did not reopen its destination-bound row"
+                }
+            }
+        }
+        fixture(compact = true)
+        fixture(compact = false)
+    }
+
+    private fun mqttPublicationJournal(context: Context, prefix: String) {
+        val journalName = "${prefix}_mqtt_publication_journal.db"
+        val mainName = "${prefix}_mqtt_archive_main.db"
+        val mainFile = context.getDatabasePath(mainName)
+        val archiveRoot = File(context.cacheDir, "${prefix}_mqtt_archive").apply { check(mkdirs() || isDirectory) }
+        val scope = "broker-scope-hash"
+        val deviceId = "retired_vehicle_1"
+        val topic = "homeassistant/sensor/retired_vehicle_1/battery/config"
+        val uncertainTopic = "homeassistant/sensor/retired_vehicle_1/range/config"
+        val first = MqttPublicationJournal(context, journalName)
+        first.recordDiscoveryAttempt(scope, deviceId, topic, "pending-hash", "Retired Vehicle", "2026-10-09T00:00:00Z")
+        first.recordDiscoveryAcknowledged(scope, deviceId, topic, "ack-hash", "Retired Vehicle", "2026-10-09T00:00:01Z", remove = false)
+        first.recordDiscoveryAttempt(scope, deviceId, uncertainTopic, "unknown-hash", "Retired Vehicle", "2026-10-09T00:00:01Z")
+        first.recordDiscoveryAcknowledged("other-account", deviceId, topic, "other-hash", "Other Vehicle", "2026-10-09T00:00:01Z", remove = false)
+        val selection = first.cleanupGroups(setOf(scope), "current_vehicle").single().selection
+        check(first.destinationEpoch(scope, deviceId) == 0L)
+        first.close()
+
+        val reopened = MqttPublicationJournal(context, journalName)
+        check(reopened.cleanupGroups(setOf(scope), "current_vehicle").single().selection == selection)
+        val operation = reopened.beginCleanup(selection, setOf(scope), "2026-10-09T00:00:02Z")
+        check(reopened.destinationEpoch(scope, deviceId) == 1L) { "Cleanup did not fence the old destination generation" }
+        val targets = reopened.cleanupTargets(operation)
+        check(targets.size == 2)
+        reopened.acknowledgeCleanupTarget(operation, targets.first().target, "2026-10-09T00:00:03Z")
+        reopened.failCleanup(operation, targets.last().target, "connection lost", "2026-10-09T00:00:04Z")
+        reopened.close()
+
+        val resumed = MqttPublicationJournal(context, journalName)
+        val partial = resumed.cleanupGroups(setOf(scope), "current_vehicle").single()
+        check(partial.state == "error" && partial.topicCount == 2 && partial.uncertainCount == 1)
+        check(partial.selection == selection)
+        check(resumed.beginCleanup(selection, setOf(scope), "2026-10-09T00:00:05Z") == operation)
+        check(resumed.destinationEpoch(scope, deviceId) == 1L) { "Retry must retain the same cleanup generation" }
+        val remaining = resumed.cleanupTargets(operation)
+        check(remaining.count { it.acknowledged } == 1)
+        resumed.acknowledgeCleanupTarget(operation, remaining.single { !it.acknowledged }.target, "2026-10-09T00:00:06Z")
+        resumed.completeCleanup(operation, "2026-10-09T00:00:07Z")
+        check(resumed.cleanupOperationCompleted(operation)) { "Completed cleanup receipt was not retained" }
+        check(resumed.cleanupGroups(setOf("other-account"), "current_vehicle").single().topicCount == 1)
+        resumed.close()
+
+        //Archiving Main must not move or reset the independent MQTT journal.
+        TelemetryDatabaseHelper(context, mainFile.absolutePath).use { helper -> helper.writableDatabase }
+        val archived = DatabaseArchiveManager.archive(mainFile, archiveRoot, "mqtt_journal_isolation")
+        check(archived.ok && !mainFile.exists()) { "Main archive fixture did not archive successfully" }
+        val afterArchive = MqttPublicationJournal(context, journalName)
+        check(afterArchive.destinationEpoch(scope, deviceId) == 1L)
+        check(afterArchive.completedCleanupOperation(selection) == operation)
+        check(afterArchive.cleanupGroups(setOf(scope), "current_vehicle").isEmpty())
+        afterArchive.close()
+    }
 
     private fun archiveFailureSafety(context: Context, prefix: String) {
         val root = File(context.cacheDir, "${prefix}_archive_failures")

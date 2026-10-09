@@ -16,6 +16,7 @@ internal class UpdateHintCreationRetry(
     private var activeAttemptToken: Long? = null
     private var attachedAttemptToken: Long? = null
     private var attached = false
+    private var presented = false
     private var exhausted = false
     private var retryAtElapsedMs: Long? = null
     private var retryRunnable: Runnable? = null
@@ -25,7 +26,7 @@ internal class UpdateHintCreationRetry(
     fun offer(resultId: Long?) {
         if (this.resultId != resultId) replaceResult(resultId)
         val currentId = resultId ?: return
-        // Once attached, creation is terminal and first draw owns consumption.
+        // While attached, first draw owns consumption; an unpresented removal can retry.
         // In particular, the now-consumed presentation gate must not invalidate
         // the callback token needed to maintain the visible window.
         if (attached) return
@@ -109,7 +110,7 @@ internal class UpdateHintCreationRetry(
         return true
     }
 
-    /** Successful WindowManager attachment is terminal for automatic creation retries. */
+    /** Attachment holds creation until first draw or cancellation. */
     fun onAttached(resultId: Long, attemptToken: Long): Boolean {
         if (this.resultId != resultId || activeAttemptToken != attemptToken) return false
         activeAttemptToken = null
@@ -117,6 +118,10 @@ internal class UpdateHintCreationRetry(
         attached = true
         cancelRetry(clearDeadline = true)
         return true
+    }
+
+    fun onPresented(resultId: Long, attemptToken: Long) {
+        if (isCurrentAttachedAttempt(resultId, attemptToken)) presented = true
     }
 
     /** Cancellation fences old callbacks but preserves attempts, exhaustion, and any retry deadline. */
@@ -127,6 +132,7 @@ internal class UpdateHintCreationRetry(
         cancelRetry(clearDeadline = false)
         refundUncreatedAttempt()
         attachedAttemptToken = null
+        if (!presented) attached = false
         val currentResultId = resultId
         if (hadLiveWork && currentResultId != null) {
             emit(
@@ -145,7 +151,10 @@ internal class UpdateHintCreationRetry(
         if (wasActive) {
             refundUncreatedAttempt()
         }
-        if (wasAttached) attachedAttemptToken = null
+        if (wasAttached) {
+            attachedAttemptToken = null
+            if (!presented) attached = false
+        }
         emit(
             "hint_creation_cancelled",
             "result_id=$resultId attempt_token=$attemptToken attempts=$attemptsBefore/$MAX_ATTEMPTS reason=$reason"
@@ -172,6 +181,7 @@ internal class UpdateHintCreationRetry(
         activeAttemptToken = null
         attachedAttemptToken = null
         attached = false
+        presented = false
         exhausted = false
         lastAttemptToken = null
     }

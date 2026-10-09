@@ -37,6 +37,7 @@ class DashboardLoadProfileTest {
         val previous = dashboardState("previous").copy(
             pollCount = 42L,
             mqttPendingCount = 7L,
+            influxVehicleId = "previous-car",
             debugReadingCount = 8L,
             vehicleKpis = VehicleKpis(socPercent = "88%"),
             archiveStorageSnapshot = ArchiveStorageSnapshot(
@@ -52,6 +53,7 @@ class DashboardLoadProfileTest {
             lastSuccessAt = "loaded-success",
             pollCount = 0L,
             mqttPendingCount = 0L,
+            influxVehicleId = "next-car",
             debugReadingCount = 0L,
             vehicleKpis = VehicleKpis(),
             archiveStorageSnapshot = ArchiveStorageSnapshot(
@@ -79,6 +81,7 @@ class DashboardLoadProfileTest {
         assertEquals("loaded-success", merged.lastSuccessAt)
         assertEquals(42L, merged.pollCount)
         assertEquals(7L, merged.mqttPendingCount)
+        assertEquals("previous-car", merged.influxVehicleId)
         assertEquals(8L, merged.debugReadingCount)
         assertEquals("88%", merged.vehicleKpis.socPercent)
         assertEquals("previous-archive", merged.archiveStorageSnapshot.archiveRootPath)
@@ -307,6 +310,10 @@ class DashboardLoadProfileTest {
             mqttClientId = "",
             mqttTopicPrefix = "",
             mqttDiscoveryPrefix = "",
+            mqttDeviceId = "",
+            mqttDeviceIdentifier = "",
+            mqttDeviceName = "",
+            mqttDeviceModel = "",
             mqttEnabledCategories = emptySet(),
             mqttStatus = "disabled",
             mqttLastError = null,
@@ -325,6 +332,7 @@ class DashboardLoadProfileTest {
             influxUsername = "",
             influxPasswordSet = false,
             influxMeasurement = "",
+            influxVehicleId = "",
             influxEnabledCategories = emptySet(),
             influxStatus = "stopped",
             influxPendingRows = 0L,

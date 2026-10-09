@@ -128,12 +128,12 @@ class DashboardUiStateStore(
 
     fun beginTabRefresh(tab: AppTab): Long = beginRefresh(tab)
 
-    fun publishChrome(generation: Long, state: DashboardState): Boolean {
-        return publish(null, generation, state)
+    fun publishChrome(generation: Long, state: DashboardState, dataRefreshed: Boolean = true): Boolean {
+        return publish(null, generation, state, dataRefreshed)
     }
 
-    fun publishTab(tab: AppTab, generation: Long, state: DashboardState): Boolean {
-        return publish(tab, generation, state)
+    fun publishTab(tab: AppTab, generation: Long, state: DashboardState, dataRefreshed: Boolean = true): Boolean {
+        return publish(tab, generation, state, dataRefreshed)
     }
 
     fun failChrome(generation: Long, error: String): Boolean {
@@ -323,7 +323,7 @@ class DashboardUiStateStore(
         }
     }
 
-    private fun publish(tab: AppTab?, generation: Long, state: DashboardState): Boolean {
+    private fun publish(tab: AppTab?, generation: Long, state: DashboardState, dataRefreshed: Boolean): Boolean {
         return synchronized(lock) {
             val flow = mutableFlow(tab)
             val current = flow.value
@@ -332,7 +332,8 @@ class DashboardUiStateStore(
             } else {
                 flow.value = CachedDashboardState(
                     state = applyRuntimeOverlays(state),
-                    loadedAtElapsedMs = clock(),
+                    // Re-reading a remote cache must not postpone the next real load.
+                    loadedAtElapsedMs = if (dataRefreshed) clock() else current?.loadedAtElapsedMs ?: 0L,
                     generation = generation,
                     inFlight = false,
                     lastError = null

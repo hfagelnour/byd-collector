@@ -5,9 +5,48 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
+import kotlin.test.assertFailsWith
 import org.json.JSONObject
 
 class HaDiscoveryBuilderTest {
+    @Test
+    fun customCarsHaveSeparateIdentityAndNameModelEditsKeepItStable() {
+        val first = config(topicPrefix = "cars/first").copy(deviceId = "first_car", deviceIdentifier = "first-device",
+            deviceName = "First car", deviceModel = "First model")
+        val second = first.copy(deviceId = "second_car", deviceIdentifier = "second-device", topicPrefix = "cars/second")
+        fun build(config: HaMqttConfig) = HaDiscoveryBuilder.discoveryMessages(config, listOf(NormalizedFieldCatalog.soc)).single()
+        val firstMessage = build(first)
+        val firstPayload = JSONObject(firstMessage.payload)
+        val secondMessage = build(second)
+        assertEquals("homeassistant/sensor/first_car/soc/config", firstMessage.topic)
+        assertEquals("first_car_soc", firstPayload.getString("unique_id"))
+        assertEquals("cars/first/state/battery", firstPayload.getString("state_topic"))
+        val device = firstPayload.getJSONObject("device")
+        assertEquals("first-device", device.getJSONArray("identifiers").getString(0))
+        assertEquals("First car", device.getString("name"))
+        assertEquals("First model", device.getString("model"))
+        assertFalse(firstMessage.topic == secondMessage.topic)
+        assertEquals("second_car_soc", JSONObject(secondMessage.payload).getString("unique_id"))
+
+        val renamed = build(first.copy(deviceName = "Renamed", deviceModel = "New model"))
+        assertEquals(firstMessage.topic, renamed.topic)
+        val renamedPayload = JSONObject(renamed.payload)
+        assertEquals(firstPayload.getString("unique_id"), renamedPayload.getString("unique_id"))
+        assertEquals(device.getJSONArray("identifiers").toString(), renamedPayload.getJSONObject("device").getJSONArray("identifiers").toString())
+    }
+
+    @Test
+    fun invalidIdsCannotProduceDiscoveryAndLegacyTombstoneFollowsCustomId() {
+        assertFailsWith<IllegalArgumentException> { HaDiscoveryBuilder.discoveryMessages(config().copy(deviceId = "bad/id")) }
+        val custom = config(enabledCategories = setOf("body")).copy(deviceId = "my_car")
+        val messages = HaDiscoveryBuilder.discoveryMessages(custom, listOf(NormalizedFieldCatalog.sunroofPosition))
+        assertEquals("homeassistant/binary_sensor/my_car/bodywork_sunroof_windoblind_position/config", messages.first().topic)
+        assertEquals("", messages.first().payload)
+        assertTrue(messages.all { "/my_car/" in it.topic })
+        val blank = HaDiscoveryBuilder.discoveryMessages(config().copy(deviceId = ""), listOf(NormalizedFieldCatalog.soc)).single()
+        assertEquals("homeassistant/sensor/byd_sealion_07/soc/config", blank.topic)
+    }
+
     @Test
     fun discoveryUsesGroupedCategoryStateTopicForSoc() {
         val messages = HaDiscoveryBuilder.discoveryMessages(

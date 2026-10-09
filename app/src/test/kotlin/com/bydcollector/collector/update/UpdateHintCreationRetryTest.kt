@@ -7,6 +7,32 @@ import kotlin.test.assertTrue
 
 class UpdateHintCreationRetryTest {
     @Test
+    fun cancelledBeforeFirstDrawCanRetryButDrawnResultAndAttemptBudgetAreTerminal() {
+        val queue = FakeQueue()
+        val tokens = mutableListOf<Long>()
+        val retry = UpdateHintCreationRetry({ queue.now }, queue::post, queue::remove,
+            { true }, { _, token -> tokens += token })
+        retry.offer(91L)
+        assertTrue(retry.onAttached(91L, tokens.last()))
+        retry.cancelPending("display_not_ready")
+        retry.offer(91L)
+        assertEquals(2, tokens.size)
+        assertTrue(retry.onAttached(91L, tokens.last()))
+        retry.onPresented(91L, tokens.last())
+        retry.cancelAttempt(91L, tokens.last(), "closed")
+        retry.offer(91L)
+        assertEquals(2, tokens.size)
+
+        repeat(3) {
+            retry.offer(92L)
+            assertTrue(retry.onAttached(92L, tokens.last()))
+            retry.cancelAttempt(92L, tokens.last(), "display_not_ready")
+        }
+        retry.offer(92L)
+        assertEquals(5, tokens.size)
+    }
+
+    @Test
     fun actualAttemptCallbacksRetryAtOneThenThreeSecondsAndExhaustAfterThreeAttempts() {
         val queue = FakeQueue()
         val tokens = mutableListOf<Long>()

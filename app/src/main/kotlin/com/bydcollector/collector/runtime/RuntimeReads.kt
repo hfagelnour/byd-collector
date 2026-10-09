@@ -11,6 +11,7 @@ import com.bydcollector.collector.data.debug.DirectDebugStore
 import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import com.bydcollector.collector.data.trips.TripDatabaseHelper
 import com.bydcollector.collector.maintenance.StorageFormatCutoverCoordinator
+import com.bydcollector.collector.mqtt.MqttCleanupCore
 import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.ui.*
@@ -26,6 +27,9 @@ internal object RuntimeReads {
     private val workers = ThreadPoolExecutor(2, 2, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue(8)) { task ->
         Thread(task, "collector-ui-query").apply { isDaemon = true }
     }
+    private val settingsWorker = ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue(8)) { task ->
+        Thread(task, "collector-ui-settings").apply { isDaemon = true }
+    }
     private val main = Handler(Looper.getMainLooper())
     private val lock = Any()
     private var dashboard: DashboardStateProvider? = null
@@ -33,12 +37,14 @@ internal object RuntimeReads {
 
     fun open(context: Context, operation: String, args: Bundle): ParcelFileDescriptor {
         require(operation in setOf("dashboard", "counts", "mainPreflight", "tripHierarchy", "tripSession",
-            "openTrip", "tripRoute", "footprints", "updates", "jobs")) { "Unknown runtime query" }
+            "openTrip", "tripRoute", "footprints", "updates", "jobs", "mqttCleanupGroups")) { "Unknown runtime query" }
         val pipe = ParcelFileDescriptor.createReliablePipe()
         val timeout = Runnable { runCatching { pipe[1].closeWithError("Runtime query timed out") } }
         try {
             main.postDelayed(timeout, 30_000L)
-            workers.execute {
+            val lightweight = operation == "mqttCleanupGroups" ||
+                (operation == "dashboard" && args.getString("profile") == DashboardLoadProfile.INITIAL.name)
+            (if (lightweight) settingsWorker else workers).execute {
                 try {
                     val result = query(context, operation, args)
                     ObjectOutputStream(ParcelFileDescriptor.AutoCloseOutputStream(pipe[1])).use { output ->
@@ -75,8 +81,22 @@ internal object RuntimeReads {
 
     private fun query(context: Context, operation: String, args: Bundle): Any? {
         val app = context.applicationContext as BydCollectorApplication
+        // Initial controls need settings, not the lock held by a telemetry/Storage refresh.
+        if (operation == "dashboard" && args.getString("profile") == DashboardLoadProfile.INITIAL.name) {
+            val source = DashboardStateProvider(context, { BydCollectorApplication.store(context) },
+                CollectorSettings(context)).loadInitial()
+            val language = VehicleKpiLanguage.valueOf(requireNotNull(args.getString("language")))
+            return app.dashboardUiStateStore.snapshotForClient(source, language)
+                .copy(logRecording = com.bydcollector.collector.diagnostics.DiagnosticLogRecorder.isRecording())
+        }
         return when (operation) {
             "jobs" -> RuntimeJobsService.snapshot(context)
+            "mqttCleanupGroups" -> {
+                val settings = CollectorSettings(context)
+                MqttCleanupCore(app.mqttPublicationJournal, configProvider = {
+                    settings.mqttConfig(includeCredentials = false).copy(username = settings.mqttUsername().takeIf { it.isNotBlank() })
+                }).groups()
+            }
             "updates" -> {
                 val check = app.updateChecks.snapshot()
                 val target = (check.uiState as? com.bydcollector.collector.update.UpdateUiState.Available)?.info

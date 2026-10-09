@@ -131,21 +131,26 @@ class RuntimeEndpointProvider : ContentProvider() {
                     Bundle()
                 }
                 "preferences" -> RuntimePreferences.snapshot(RuntimePreferences.get(ctx))
-                "preferences.edit" -> RuntimePreferences.editOwner(RuntimePreferences.get(ctx), requireNotNull(extras))
+                "preferences.edit" -> RuntimePreferences.editOwner(ctx, RuntimePreferences.get(ctx), requireNotNull(extras))
                 "secret.read", "secret.write", "secret.clear" -> {
                     val name = extras.getString("name")
                     require(name in setOf(CollectorSettings.SECRET_MQTT_USERNAME, CollectorSettings.SECRET_MQTT_PASSWORD,
                         CollectorSettings.SECRET_INFLUX_USERNAME, CollectorSettings.SECRET_INFLUX_PASSWORD,
                         CollectorSettings.SECRET_TELEGRAM_BOT_TOKEN)) { "Unknown credential" }
+                    val secretName = requireNotNull(name)
                     val store = KeystoreSecretStore(ctx)
                     Bundle().apply {
                         when (method) {
-                            "secret.read" -> putString("value", store.read(name!!))
-                            "secret.clear" -> putBoolean("ok", store.clear(name!!))
+                            "secret.read" -> putString("value", store.read(secretName))
+                            "secret.clear" -> putBoolean("ok", RuntimeJobsService.withMqttConfigurationEdit(ctx, setOf(secretName)) {
+                                store.clear(secretName)
+                            })
                             else -> {
                                 val value = requireNotNull(extras.getString("value"))
                                 require(value.length <= 16_384) { "Credential too large" }
-                                putBoolean("ok", store.write(name!!, value))
+                                putBoolean("ok", RuntimeJobsService.withMqttConfigurationEdit(ctx, setOf(secretName)) {
+                                    store.write(secretName, value)
+                                })
                             }
                         }
                     }

@@ -50,6 +50,11 @@ private fun BottomTabIcon.drawableRes(): Int = when (this) {
 }
 
 @Composable
+fun DeleteIcon(contentDescription: String, color: Color, modifier: Modifier = Modifier) {
+    Icon(painterResource(R.drawable.ic_delete), contentDescription, modifier, tint = color)
+}
+
+@Composable
 fun ClearIcon(contentDescription: String, color: Color, modifier: Modifier = Modifier) {
     Icon(
         painter = painterResource(id = R.drawable.ic_clear),

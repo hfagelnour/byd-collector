@@ -3,10 +3,13 @@ package com.bydcollector.collector.influx
 import java.time.OffsetDateTime
 
 object InfluxLineProtocol {
-    fun toLine(row: InfluxPendingHistoryRow, config: InfluxConfig, vehicle: String = "sea_lion_07"): String {
+    fun toLine(row: InfluxPendingHistoryRow, config: InfluxConfig): String {
+        require(config.validateVehicleId() == null) {
+            "InfluxDB vehicle ID cannot contain carriage returns, line feeds, or NUL characters"
+        }
         val measurement = escapeMeasurement(config.normalizedMeasurement())
         val tags = listOf(
-            "vehicle=${escapeTag(vehicle)}",
+            "vehicle=${escapeTag(config.normalizedVehicleId())}",
             "field_key=${escapeTag(row.fieldKey)}",
             "category=${escapeTag(row.category)}",
             "quality=${escapeTag(row.quality.lowercase())}",

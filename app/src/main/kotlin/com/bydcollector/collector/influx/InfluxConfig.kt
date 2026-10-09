@@ -12,7 +12,8 @@ data class InfluxConfig(
     val measurement: String,
     val enabledCategories: Set<String>,
     val alternativeHost: String? = null,
-    val alternativePort: Int? = null
+    val alternativePort: Int? = null,
+    val vehicleId: String = DEFAULT_VEHICLE_ID
 ) {
     val baseUrl: String get() = "http://${host.trim().trimEnd('/')}:$port"
 
@@ -52,12 +53,19 @@ data class InfluxConfig(
     }
     fun normalizedDatabase(): String = database.trim().ifBlank { DEFAULT_DATABASE }
     fun normalizedMeasurement(): String = measurement.trim().ifBlank { DEFAULT_MEASUREMENT }
+    fun normalizedVehicleId(): String = vehicleId.ifBlank { DEFAULT_VEHICLE_ID }
+    fun validateVehicleId(): String? = if (isValidVehicleId(vehicleId)) null else
+        "InfluxDB vehicle ID cannot contain carriage returns, line feeds, or NUL characters"
     fun isCategoryEnabled(category: String): Boolean = enabledCategories.contains(category)
 
     companion object {
         const val DEFAULT_PORT = 8086
         const val DEFAULT_DATABASE = "bydcollector"
         const val DEFAULT_MEASUREMENT = "byd_state"
+        const val DEFAULT_VEHICLE_ID = "sea_lion_07"
+
+        fun isValidVehicleId(vehicleId: String): Boolean =
+            vehicleId.none { it == '\r' || it == '\n' || it == '\u0000' }
 
         private fun isValidHost(host: String): Boolean {
             return host.isNotBlank() && host == host.trim() && host.none { it.isWhitespace() || it == '/' || it == '\\' }

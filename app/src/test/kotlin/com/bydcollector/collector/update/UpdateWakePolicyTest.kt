@@ -1,10 +1,33 @@
 package com.bydcollector.collector.update
 
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class UpdateWakePolicyTest {
+    @Test
+    fun displayAndBroadcastWakeInEitherOrderRestartTheScheduleOnlyOnce() {
+        var now = 1_000L
+        val policy = UpdateWakePolicy()
+        val scheduler = UpdateAutoCheckScheduler(30_000L, { now })
+        policy.onEntry(now, interactive = true)
+        policy.onSleep()
+        fun wake() {
+            if (policy.onWake("android.intent.action.SCREEN_ON", now)) {
+                scheduler.reset()
+                scheduler.onRuntimeStarted(enabled = true)
+            }
+        }
+        now = 2_000L
+        wake() // Display callback and SCREEN_ON use the same policy operation.
+        now = 8_000L
+        wake() // A delayed broadcast must not postpone the original 32,000 ms deadline.
+        assertEquals(UpdateAutoCheckAction.Schedule(24_000L), scheduler.onForeground(enabled = true))
+        now = 32_000L
+        assertEquals(UpdateAutoCheckAction.Run, scheduler.onTimerElapsed(enabled = true, foreground = false))
+    }
+
     @Test
     fun coldEntryInitializesAwakeOrSleepingWithoutInventingWake() {
         val awake = UpdateWakePolicy()

@@ -51,6 +51,7 @@
 
         <activity
             android:name="com.bydcollector.collector.runtime.RuntimeLauncherActivity"
+            android:launchMode="singleTask"
             android:excludeFromRecents="true"
             android:exported="false" />
         <activity-alias

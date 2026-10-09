@@ -21,6 +21,7 @@ class HaMqttMessageFactory(
 
     fun discoveryMessages(configOverride: HaMqttConfig): MqttMessageBuildResult {
         val config = configOverride
+        config.validateIdentity()?.let { return MqttMessageBuildResult.Failure("mqtt_identity_invalid", it) }
         return MqttMessageBuildResult.Success(HaDiscoveryBuilder.discoveryMessages(config))
     }
 

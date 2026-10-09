@@ -12,6 +12,7 @@ import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.data.local.TelegramLegacyMigrationDecision
 import com.bydcollector.collector.data.local.TelegramLegacySnapshot
 import com.bydcollector.collector.data.local.TelegramStore
+import com.bydcollector.collector.mqtt.MqttPublicationJournal
 import com.bydcollector.collector.data.trips.TripDatabaseHelper
 import com.bydcollector.collector.data.trips.TripStore
 import com.bydcollector.collector.data.trips.TripCompression
@@ -52,6 +53,7 @@ import com.bydcollector.collector.data.local.HistoricalPollEndpoint
 class BydCollectorApplication : Application() {
     @Volatile private var telemetryStore: TelemetryStore? = null
     private var telegramStore: TelegramStore? = null
+    val mqttPublicationJournal by lazy(LazyThreadSafetyMode.SYNCHRONIZED) { MqttPublicationJournal(applicationContext) }
     private var telegramStorageError: String? = null
     private var telegramLegacyMigrationUnresolved = false
     private var tripsStore: TripStore? = null

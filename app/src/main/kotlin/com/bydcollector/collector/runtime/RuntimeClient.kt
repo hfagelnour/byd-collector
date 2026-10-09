@@ -13,7 +13,7 @@ import com.bydcollector.collector.service.TripCompressionService
 import com.bydcollector.collector.diagnostics.DiagnosticLogRecorder
 import com.bydcollector.collector.diagnostics.DiagnosticShareStage
 
-/** Process-local display mirror; it owns no worker and never manufactures a Start. */
+/** Process-local display mirror; it owns no collection/export executor or run intent. */
 internal object RuntimeClient {
     lateinit var context: Context
         private set
@@ -28,6 +28,31 @@ internal object RuntimeClient {
     private val token = android.os.Binder()
     private var uiVisible = false
     private var kpiVisible = false
+    private val lifecycleExecutor = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { task ->
+        Thread(task, "collector-ui-lifecycle")
+    }
+    private val visibilityDelivery = RuntimeVisibilityDelivery(
+        schedule = { task, delay -> lifecycleExecutor.schedule(task, delay, java.util.concurrent.TimeUnit.MILLISECONDS); Unit },
+        deliver = { ui, kpi -> control("visibility", Bundle().apply {
+            putBinder("token", token); putBoolean("ui", ui); putBoolean("kpi", kpi)
+        }); Unit },
+        canRetry = { !com.bydcollector.collector.service.CollectorSettings(context).isUserShutdownRequested() },
+        onFailure = { recordControlFailure("visibility", it) }
+    )
+
+    fun controlAsync(operation: String, args: Bundle = Bundle(), onSuccess: (Bundle) -> Unit = {}) {
+        lifecycleExecutor.execute {
+            runCatching { control(operation, args) }
+                .onSuccess(onSuccess)
+                .onFailure { recordControlFailure(operation, it) }
+        }
+    }
+
+    private fun recordControlFailure(operation: String, error: Throwable) {
+        android.util.Log.e("CollectorRuntime", "UI lifecycle IPC failed: $operation", error)
+        (context as BydCollectorApplication).recordUpdateEvent("ui_lifecycle_ipc_failed",
+            "operation=$operation error=${error::class.java.simpleName}: ${error.message}")
+    }
 
     fun control(operation: String, args: Bundle = Bundle()): Bundle {
         args.putString("operation", operation)
@@ -37,15 +62,12 @@ internal object RuntimeClient {
     fun visibility(ui: Boolean = uiVisible, kpi: Boolean = kpiVisible) {
         uiVisible = ui
         kpiVisible = kpi
-        control("visibility", Bundle().apply {
-            putBinder("token", token); putBoolean("ui", ui); putBoolean("kpi", kpi)
-        })
+        visibilityDelivery.update(ui, kpi)
     }
 
     fun initialize(context: Context) {
         check(BuildConfig.RUNTIME_CLIENT)
         this.context = context.applicationContext
-        refresh()
     }
 
     fun refresh() {

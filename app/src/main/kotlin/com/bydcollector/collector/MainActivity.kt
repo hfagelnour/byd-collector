@@ -25,6 +25,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.FileProvider
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -38,6 +39,7 @@ import com.bydcollector.collector.data.debug.DirectDebugDatabaseResolver
 import com.bydcollector.collector.data.debug.DirectDebugStore
 import com.bydcollector.collector.diagnostics.DiagnosticLogRecorder
 import com.bydcollector.collector.influx.InfluxActionResult
+import com.bydcollector.collector.influx.InfluxConfig
 import com.bydcollector.collector.influx.InfluxActions
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
 import com.bydcollector.collector.maintenance.DbMaintenanceRuntimeStatus
@@ -53,6 +55,7 @@ import com.bydcollector.collector.ha.HaExportChannel
 import com.bydcollector.collector.ha.HaRunSession
 import com.bydcollector.collector.ui.compose.validEndpointDraft
 import com.bydcollector.collector.mqtt.MqttActionResult
+import com.bydcollector.collector.mqtt.HaMqttConfig
 import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.service.CollectorServiceController
 import com.bydcollector.collector.service.CollectorSettings
@@ -77,6 +80,9 @@ import com.bydcollector.collector.ui.compose.TelegramConfig
 import com.bydcollector.collector.ui.compose.TelegramMessageConfig
 import com.bydcollector.collector.ui.compose.TelegramMessageType
 import com.bydcollector.collector.ui.compose.TelegramTestStatus
+import com.bydcollector.collector.ui.compose.MqttCleanupUiState
+import com.bydcollector.collector.mqtt.MqttCleanupGroup
+import com.bydcollector.collector.mqtt.MqttCleanupSelection
 import com.bydcollector.collector.ui.compose.TelegramUiActions
 import com.bydcollector.collector.ui.compose.TelegramUiState
 import com.bydcollector.collector.ui.compose.CurrentTripUi
@@ -115,7 +121,8 @@ class MainActivity : ComponentActivity() {
             putString("kind", kind); putString("args", args.toString())
         }).getString("id") ?: error("Runtime did not accept the task")
     }.onFailure {
-        actionUiState = actionUiState.copy(mqttTest = false, influxTest = false, adbGrant = false)
+        actionUiState = actionUiState.copy(mqttTest = false,
+            mqttCleanup = actionUiState.mqttCleanup && kind != "mqttCleanup", influxTest = false, adbGrant = false)
         diagnosticsBusy = false
         Toast.makeText(this, it.message ?: "Runtime task failed", Toast.LENGTH_LONG).show()
     }.getOrNull()
@@ -126,6 +133,7 @@ class MainActivity : ComponentActivity() {
         val active = jobs.filter { it.optString("status") in setOf("queued", "running") }
         diagnosticsBusy = active.any { it.getString("kind").startsWith("log") }
         actionUiState = actionUiState.copy(mqttTest = active.any { it.getString("kind") == "mqttTest" },
+            mqttCleanup = active.any { it.getString("kind") == "mqttCleanup" },
             influxTest = active.any { it.getString("kind") == "influxTest" })
         active.firstOrNull { it.getString("kind") == "updateDownload" }?.let { job ->
             val args = job.getJSONObject("args")
@@ -159,6 +167,10 @@ class MainActivity : ComponentActivity() {
                         "application/vnd.android.package-archive").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
                     updateRuntime.onInstallerLaunched()
                     updateUiState = UpdateUiState.Hidden
+                } else if (kind == "mqttCleanup") {
+                    refreshMqttCleanupGroups()
+                    val s = strings(uiLanguage)
+                    Toast.makeText(this, if (success) s.haIdentity.mqttCleanupSuccess else "${s.haIdentity.mqttCleanupFailed}\n${job.optString("error")}", Toast.LENGTH_LONG).show()
                 } else if (kind != "access") {
                     val message = if (success) result.optString("message").ifBlank { "$kind: OK" } else job.optString("error")
                     Toast.makeText(this, message, Toast.LENGTH_LONG).show()
@@ -180,6 +192,7 @@ class MainActivity : ComponentActivity() {
     private val dashboardExecutor = namedSingleThreadExecutor("byd-ui-dash")
     private val dashboardCountExecutor = namedSingleThreadExecutor("byd-ui-counts")
     private val diagnosticsExecutor = namedSingleThreadExecutor("byd-diagnostics")
+    private val mqttCleanupExecutor = namedSingleThreadExecutor("byd-mqtt-identities")
     private val updateExecutor = namedSingleThreadExecutor("byd-update")
     private val updateChecks: UpdateCheckSession
         get() = (applicationContext as BydCollectorApplication).updateChecks
@@ -238,6 +251,8 @@ class MainActivity : ComponentActivity() {
     private var backgroundSetupPromptAutoLaunch = false
     private var diagnosticsBusy by mutableStateOf(false)
     private var actionUiState by mutableStateOf(BydCollectorActionUiState())
+    private var mqttCleanupUiState by mutableStateOf(MqttCleanupUiState())
+    private var mqttCleanupRequestGeneration = 0L
     private var archiveDeleteDispatchStartedAtMs: Long? = null
     private var tripsRequestGeneration = 0L
     private var currentTripRefreshGeneration = 0L
@@ -246,6 +261,7 @@ class MainActivity : ComponentActivity() {
     @Volatile private var currentBootId: String? = null
     @Volatile private var forcedRefreshPending = false
     private var credentialsLoadStarted = false
+    private var uiInitialized = false
     private var credentialsLoaded = false
     private var mqttCredentialRevision = 0L
     private var influxCredentialRevision = 0L
@@ -573,7 +589,7 @@ class MainActivity : ComponentActivity() {
 
         override fun onStartMqtt() {
             refreshStoreBackedState()
-            if (actionUiState.mqttTest || CollectorService.mqttConnection.owned) return
+            if (actionUiState.mqttTest || actionUiState.mqttCleanup || CollectorService.mqttConnection.owned) return
             if (!CollectorService.mqttConnection.owned && !validateMqttDraft()) return
             requestAccessCheck("start_mqtt", AccessCheckMode.NORMAL)
             if (!saveMqttDraft()) {
@@ -600,11 +616,12 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onTestMqtt() {
-            if (actionUiState.mqttTest || !validateMqttDraft(mqttDraft.editingProfile)) return
+            if (actionUiState.mqttTest || actionUiState.mqttCleanup || !validateMqttDraft(mqttDraft.editingProfile)) return
             val selected = mqttDraft.editingProfile
             actionUiState = actionUiState.copy(mqttTest = true)
             if (BuildConfig.RUNTIME_CLIENT) {
                 if (saveMqttDraft()) submitRuntimeJob("mqttTest", JSONObject().put("profile", selected.name))
+                else actionUiState = actionUiState.copy(mqttTest = false)
                 return
             }
             runMqttChannelAction("MQTT test") { actionStore ->
@@ -626,12 +643,22 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onMqttDraftChanged(draft: MqttDraft) {
-            if (CollectorService.mqttConnection.owned || actionUiState.mqttTest) return
+            if (CollectorService.mqttConnection.owned || actionUiState.mqttTest || actionUiState.mqttCleanup) return
             if (draft.username != mqttDraft.username || draft.password != mqttDraft.password) {
                 mqttCredentialRevision += 1L
             }
             mqttDraft = draft
             saveMqttDraft()
+        }
+
+        override fun onRefreshMqttCleanup() = refreshMqttCleanupGroups()
+
+        override fun onCleanupMqttIdentity(selection: MqttCleanupSelection) {
+            if (actionUiState.mqttCleanup) return
+            actionUiState = actionUiState.copy(mqttCleanup = true)
+            submitRuntimeJob("mqttCleanup", JSONObject()
+                .put("deviceId", selection.deviceId).put("fingerprint", selection.fingerprint))
+            refresh()
         }
 
         override fun onStartInflux() {
@@ -797,6 +824,51 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (BuildConfig.RUNTIME_CLIENT) {
+            initializeRuntimeUi(savedInstanceState)
+        } else initializeUi(savedInstanceState)
+    }
+
+    private fun initializeRuntimeUi(savedInstanceState: Bundle?) {
+        if (RuntimePreferences.isInitialized() &&
+            BydCollectorApplication.dashboardUiStateStore(applicationContext).currentChrome() != null) {
+            initializeUi(savedInstanceState)
+            return
+        }
+        val loading = android.widget.TextView(this).apply {
+            gravity = android.view.Gravity.CENTER
+            setTextColor(android.graphics.Color.rgb(231, 237, 245))
+            setBackgroundColor(android.graphics.Color.rgb(8, 13, 18))
+            textSize = 18f
+        }
+        setContentView(loading)
+        dashboardExecutor.execute {
+            val result = runCatching {
+                RuntimeClient.refresh()
+                RuntimePreferences.get(applicationContext)
+                val cache = BydCollectorApplication.dashboardUiStateStore(applicationContext)
+                if (cache.currentChrome() == null) {
+                    val initialSettings = CollectorSettings(applicationContext)
+                    cache.seed(DashboardStateProvider(applicationContext,
+                        { BydCollectorApplication.store(applicationContext) }, initialSettings).loadInitial())
+                }
+            }
+            runOnUiThread {
+                if (destroyed || isFinishing) return@runOnUiThread
+                result.onSuccess {
+                    initializeUi(savedInstanceState)
+                    if (lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED)) startUi()
+                    if (lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) resumeUi()
+                }.onFailure { error ->
+                    Log.e(TAG, "UI initialization failed", error)
+                    loading.text = "BYD Collector\n${dashboardErrorDetail(error)}\nНатисніть, щоб повторити / Tap to retry"
+                    loading.setOnClickListener { loading.setOnClickListener(null); initializeRuntimeUi(savedInstanceState) }
+                }
+            }
+        }
+    }
+
+    private fun initializeUi(savedInstanceState: Bundle?) {
         if (!BuildConfig.RUNTIME_CLIENT) CollectorService.influxRuntimeDiagnostics.attachJournal(applicationContext)
         navigationSessionGeneration = navigationSession.captureGeneration()
         settings = CollectorSettings(applicationContext)
@@ -822,6 +894,10 @@ class MainActivity : ComponentActivity() {
             clientId = settings.mqttClientId(),
             topicPrefix = settings.mqttTopicPrefix(),
             discoveryPrefix = settings.mqttDiscoveryPrefix(),
+            deviceId = settings.mqttDeviceId(),
+            deviceIdentifier = settings.mqttDeviceIdentifier(),
+            deviceName = settings.mqttDeviceName(),
+            deviceModel = settings.mqttDeviceModel(),
             alternativeHost = settings.mqttAlternativeHost().orEmpty(),
             alternativePort = settings.mqttAlternativePort()?.toString().orEmpty()
         )
@@ -830,6 +906,7 @@ class MainActivity : ComponentActivity() {
             port = settings.influxPort().toString(),
             database = settings.influxDatabase(),
             measurement = settings.influxMeasurement(),
+            vehicleId = settings.influxVehicleId(),
             alternativeHost = settings.influxAlternativeHost().orEmpty(),
             alternativePort = settings.influxAlternativePort()?.toString().orEmpty()
         )
@@ -849,9 +926,18 @@ class MainActivity : ComponentActivity() {
         setContent {
             val renderedOfferResultId = updateOfferResultId
             val chromeSnapshot by dashboardUiStateStore.chromeState.collectAsStateWithLifecycle()
-            val tabSnapshot by dashboardUiStateStore.tabState(activeTab).collectAsStateWithLifecycle()
+            // A different flow must start with its own cached value, not the previous tab's frame.
+            val tabSnapshot = key(activeTab) {
+                val snapshot by dashboardUiStateStore.tabState(activeTab).collectAsStateWithLifecycle()
+                snapshot
+            }
             val renderedChrome = chromeSnapshot?.state
-            val renderedTab = tabSnapshot?.state ?: renderedChrome
+            val renderedTab = (tabSnapshot?.state ?: renderedChrome)?.let { state ->
+                if (activeTab == AppTab.STORAGE && tabSnapshot?.lastError != null) state.copy(
+                    archiveStorageScanPending = false,
+                    archiveStorageScanError = tabSnapshot.lastError
+                ) else state
+            }
             // Cached content stays real during refresh; only an empty pending archive scan is a placeholder.
             val tabContentReady = renderedTab != null &&
                 (activeTab != AppTab.STORAGE || !renderedTab.archiveStorageScanPending ||
@@ -886,12 +972,14 @@ class MainActivity : ComponentActivity() {
                 databaseMaintenanceUiState = currentMaintenanceUiState(renderedChrome),
                 diagnosticsBusy = diagnosticsBusy,
                 actionUiState = actionUiState,
+                mqttCleanupUiState = mqttCleanupUiState,
                 actions = uiActions,
                 backgroundSetupPromptVisible = backgroundSetupPromptVisible,
                 onOpenBackgroundSettingsFromPrompt = ::onOpenBackgroundSettingsFromPrompt,
                 onDismissBackgroundSetupPrompt = ::onDismissBackgroundSetupPrompt
             )
         }
+        uiInitialized = true
         loadCredentialsAfterFirstFrame()
         updateRuntime.start("activity")
         dashboardExecutor.execute {
@@ -921,14 +1009,22 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        if (uiInitialized) startUi()
+    }
+
+    private fun startUi() {
         if (BuildConfig.RUNTIME_CLIENT) contentResolver.registerContentObserver(RuntimeEndpoint.uri, false, runtimeObserver)
         updateRuntime.onUiVisible()
-        if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.control("attach")
+        if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.controlAsync("attach")
         else if (!settings.isUserShutdownRequested()) CollectorServiceController.start(this)
     }
 
     override fun onResume() {
         super.onResume()
+        if (uiInitialized) resumeUi()
+    }
+
+    private fun resumeUi() {
         foreground = true
         updateRuntime.onUiResumed()
         consumeUpdateHintOpen()
@@ -948,7 +1044,7 @@ class MainActivity : ComponentActivity() {
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         mainWindowHasFocus = hasFocus
-        if (hasFocus && ::settings.isInitialized) {
+        if (hasFocus && uiInitialized) {
             maybeContinueStartupAccessFlow()
             syncUpdateCheckUi()
         }
@@ -957,6 +1053,7 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        if (!uiInitialized) return
         reopenAfterExplicitLauncherEntry(intent)
         consumeUpdateHintOpen()
         syncUpdateCheckUi()
@@ -1072,11 +1169,17 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun consumeUpdateHintOpen() {
-        if ((if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.control("hintOpen").getBoolean("opened") else (applicationContext as BydCollectorApplication).updateHints.consumeOpenRequest())) {
-            navigationSession.selectTab(AppTab.EXTRA)
-            updateKpiVisibility()
-            updatePresentationRevision = -1L
-        }
+        if (BuildConfig.RUNTIME_CLIENT) {
+            RuntimeClient.controlAsync("hintOpen") { response ->
+                runOnUiThread { if (!destroyed && response.getBoolean("opened")) openUpdateHintTab() }
+            }
+        } else if ((applicationContext as BydCollectorApplication).updateHints.consumeOpenRequest()) openUpdateHintTab()
+    }
+
+    private fun openUpdateHintTab() {
+        navigationSession.selectTab(AppTab.EXTRA)
+        updateKpiVisibility()
+        updatePresentationRevision = -1L
     }
 
     override fun onPause() {
@@ -1089,8 +1192,8 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
-        if (BuildConfig.RUNTIME_CLIENT) contentResolver.unregisterContentObserver(runtimeObserver)
-        if (!isChangingConfigurations && !settings.isUserShutdownRequested()) {
+        if (BuildConfig.RUNTIME_CLIENT && uiInitialized) contentResolver.unregisterContentObserver(runtimeObserver)
+        if (uiInitialized && !isChangingConfigurations && !settings.isUserShutdownRequested()) {
             updateRuntime.onUiHidden()
         }
         super.onStop()
@@ -1101,8 +1204,10 @@ class MainActivity : ComponentActivity() {
         if (BuildConfig.RUNTIME_CLIENT) contentResolver.unregisterContentObserver(runtimeObserver)
         if (BuildConfig.RUNTIME_CLIENT) runCatching { RuntimeClient.visibility(ui = false, kpi = false) }
         else com.bydcollector.collector.service.KpiUiVisibility.update(kpiVisibilityOwner, false)
-        updateChecks.removeListener(updateCheckListener)
-        releaseNotesHistory.removeListener(releaseNotesListener)
+        if (uiInitialized) {
+            updateChecks.removeListener(updateCheckListener)
+            releaseNotesHistory.removeListener(releaseNotesListener)
+        }
         archiveDeleteDispatchStartedAtMs = null
         actionUiState = BydCollectorActionUiState()
         diagnosticsBusy = false
@@ -1118,6 +1223,7 @@ class MainActivity : ComponentActivity() {
         dashboardExecutor.shutdownNow()
         dashboardCountExecutor.shutdownNow()
         diagnosticsExecutor.shutdownNow()
+        mqttCleanupExecutor.shutdownNow()
         updateExecutor.shutdownNow()
         if (::settingsPreferences.isInitialized) {
             settingsPreferences.unregisterOnSharedPreferenceChangeListener(settingsChangeListener)
@@ -1130,6 +1236,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun updateKpiVisibility() {
+        if (!uiInitialized) return
         if (BuildConfig.RUNTIME_CLIENT) {
             RuntimeClient.visibility(kpi = !destroyed && foreground && activeTab == AppTab.ALL_PARAMETERS && kpiViewportVisible)
             return
@@ -1666,7 +1773,7 @@ class MainActivity : ComponentActivity() {
             tab = tab,
             storageRefreshPending = tabSnapshot?.state?.let { state ->
                 state.archiveStorageJobStatus.running || state.archiveStorageScanPending
-            } == true || tabSnapshot?.loadedAtElapsedMs == 0L || actionUiState.archiveDeleteDispatch
+            } == true || tabSnapshot?.lastError != null || tabSnapshot?.loadedAtElapsedMs == 0L || actionUiState.archiveDeleteDispatch
         )
         val tabDue = profile != null && (
             force || dashboardSnapshotDue(tabSnapshot?.loadedAtElapsedMs, tabIntervalMs, nowMs)
@@ -1710,7 +1817,7 @@ class MainActivity : ComponentActivity() {
             }
             val chromeResult = if (chromeGeneration != null) {
                 val reusableTabState = tabResult?.getOrNull()
-                    ?.takeIf { profile?.healthDetail != null }
+                    ?.takeIf { profile?.healthDetail != null && (tabDue || !chromeDue) }
                 reusableTabState?.let { Result.success(it) } ?: runCatching {
                     if (BuildConfig.RUNTIME_CLIENT && !chromeDue) RuntimeReads.read<DashboardState>(this@MainActivity, "dashboard", Bundle().apply {
                         putString("profile", DashboardLoadProfile.CHROME.name); putString("language", kpiLanguage.name); putBoolean("cached", true)
@@ -1730,7 +1837,7 @@ class MainActivity : ComponentActivity() {
                 if (tabGeneration != null && tabResult != null) {
                     tabResult
                         .onSuccess { state ->
-                            dashboardUiStateStore.publishTab(tab, tabGeneration, state)
+                            dashboardUiStateStore.publishTab(tab, tabGeneration, state, dataRefreshed = tabDue)
                             reconcileActionUiState(state)
                         }
                         .onFailure { error ->
@@ -1741,7 +1848,10 @@ class MainActivity : ComponentActivity() {
                 if (chromeGeneration != null && chromeResult != null) {
                     chromeResult
                         .onSuccess { state ->
-                            dashboardUiStateStore.publishChrome(chromeGeneration, state)
+                            dashboardUiStateStore.publishChrome(
+                                chromeGeneration, state,
+                                dataRefreshed = chromeDue || (tabDue && profile?.healthDetail != null)
+                            )
                             reconcileActionUiState(state)
                         }
                         .onFailure { error ->
@@ -1834,6 +1944,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun showBackgroundSetupPrompt(autoLaunch: Boolean) {
+        if (BuildConfig.RUNTIME_CLIENT) {
+            RuntimeClient.controlAsync("accessFlow", Bundle().apply { putString("request", "background") })
+            return
+        }
         backgroundSetupPromptAutoLaunch = autoLaunch
         backgroundSetupPromptVisible = true
     }
@@ -1922,6 +2036,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun requestAdbAuthorizationFlow(source: String): Boolean {
+        if (BuildConfig.RUNTIME_CLIENT) {
+            actionUiState = actionUiState.copy(adbGrant = false)
+            RuntimeClient.controlAsync("accessFlow", Bundle().apply { putString("request", "adb") })
+            return true
+        }
         recordOperationalEvent(
             "adb_authorization_flow_started",
             "Starting local ADB RSA authorization request",
@@ -1954,6 +2073,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun maybeContinueStartupAccessFlow() {
+        if (BuildConfig.RUNTIME_CLIENT) return // The owner serializes all access before opening this UI.
         if (destroyed || startupAccessFlowCompleted) return
         if (startupAdbSelfCheckPosted) return
         if (startupHardFlowBlocked()) return
@@ -1966,6 +2086,11 @@ class MainActivity : ComponentActivity() {
 
     private fun maybeRequestOverlayAccess(userInitiated: Boolean): Boolean {
         if (destroyed || !foreground || !mainWindowHasFocus || !settings.isUpdateHintEnabled()) return false
+        if (BuildConfig.RUNTIME_CLIENT) {
+            if (!userInitiated || RuntimeClient.state.getBoolean("overlay")) return false
+            RuntimeClient.controlAsync("accessFlow", Bundle().apply { putString("request", "overlay") })
+            return true
+        }
         if (runtimePermissionRequestInFlight) return true
         if ((if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.state.getBoolean("overlay") else Settings.canDrawOverlays(this))) return false
         val prefs = getSharedPreferences(STARTUP_SETUP_PREFS, MODE_PRIVATE)
@@ -2264,33 +2389,64 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun refreshMqttCleanupGroups() {
+        val generation = ++mqttCleanupRequestGeneration
+        // Saved configuration is already local; historical topics are a separate background read.
+        mqttCleanupUiState = MqttCleanupUiState(loading = true,
+            groups = listOf(MqttCleanupGroup.current(settings.mqttConfig(includeCredentials = false))))
+        mqttCleanupExecutor.execute {
+            val result = runCatching { RuntimeReads.read<List<MqttCleanupGroup>>(this, "mqttCleanupGroups") }
+            runOnUiThread {
+                if (destroyed || generation != mqttCleanupRequestGeneration) return@runOnUiThread
+                mqttCleanupUiState = result.fold(
+                    onSuccess = { MqttCleanupUiState(groups = it) },
+                    onFailure = { mqttCleanupUiState.copy(loading = false, error = it.message ?: strings(uiLanguage).haIdentity.mqttCleanupFailed) }
+                )
+            }
+        }
+    }
+
     private fun saveMqttDraft(): Boolean {
         if (CollectorService.mqttConnection.owned) return true
-        //keeps saved passwords sticky while empty password fields mean "leave existing secret unchanged"
-        settings.setMqttHost(mqttDraft.host)
-        settings.setMqttPort(mqttDraft.port.toIntOrNull() ?: 0)
-        settings.setMqttAlternativeHost(mqttDraft.alternativeHost)
-        settings.setMqttAlternativePort(if (mqttDraft.alternativePort.isBlank()) null else mqttDraft.alternativePort.toIntOrNull() ?: 0)
-        val usernameStored = if (credentialsLoaded || mqttDraft.username.isNotBlank()) {
-            settings.setMqttUsername(mqttDraft.username)
-        } else {
-            true
+        if (actionUiState.mqttCleanup) return false
+        return runCatching {
+            //keeps saved passwords sticky while empty password fields mean "leave existing secret unchanged"
+            settings.setMqttHost(mqttDraft.host)
+            settings.setMqttPort(mqttDraft.port.toIntOrNull() ?: 0)
+            settings.setMqttAlternativeHost(mqttDraft.alternativeHost)
+            settings.setMqttAlternativePort(if (mqttDraft.alternativePort.isBlank()) null else mqttDraft.alternativePort.toIntOrNull() ?: 0)
+            val usernameStored = if (credentialsLoaded || mqttDraft.username.isNotBlank()) {
+                settings.setMqttUsername(mqttDraft.username)
+            } else {
+                true
+            }
+            val passwordStored = mqttDraft.password.isBlank() || settings.setMqttPassword(mqttDraft.password)
+            settings.setMqttClientId(mqttDraft.clientId)
+            settings.setMqttTopicPrefix(mqttDraft.topicPrefix)
+            settings.setMqttDiscoveryPrefix(mqttDraft.discoveryPrefix)
+            settings.setMqttDeviceId(mqttDraft.deviceId)
+            settings.setMqttDeviceIdentifier(mqttDraft.deviceIdentifier)
+            settings.setMqttDeviceName(mqttDraft.deviceName)
+            settings.setMqttDeviceModel(mqttDraft.deviceModel)
+            val stored = usernameStored && passwordStored
+            if (!stored) {
+                mqttDraft = mqttDraft.copy(
+                    username = settings.mqttUsername(),
+                    password = settings.mqttPassword()
+                )
+            }
+            stored
+        }.getOrElse {
+            Toast.makeText(this, it.message ?: strings(uiLanguage).haIdentity.mqttCleanupFailed, Toast.LENGTH_LONG).show()
+            false
         }
-        val passwordStored = mqttDraft.password.isBlank() || settings.setMqttPassword(mqttDraft.password)
-        settings.setMqttClientId(mqttDraft.clientId)
-        settings.setMqttTopicPrefix(mqttDraft.topicPrefix)
-        settings.setMqttDiscoveryPrefix(mqttDraft.discoveryPrefix)
-        val stored = usernameStored && passwordStored
-        if (!stored) {
-            mqttDraft = mqttDraft.copy(
-                username = settings.mqttUsername(),
-                password = settings.mqttPassword()
-            )
-        }
-        return stored
     }
 
     private fun validateMqttDraft(selected: HaEndpointProfile? = null): Boolean {
+        if (selected == null && !HaMqttConfig.isValidDeviceId(mqttDraft.deviceId)) {
+            Toast.makeText(this, strings(uiLanguage).haIdentity.invalidMqttDeviceId, Toast.LENGTH_LONG).show()
+            return false
+        }
         val valid = when (selected) {
             HaEndpointProfile.PRIMARY -> validEndpointDraft(mqttDraft.host, mqttDraft.port)
             HaEndpointProfile.ALTERNATIVE -> validEndpointDraft(mqttDraft.alternativeHost, mqttDraft.alternativePort)
@@ -2316,6 +2472,7 @@ class MainActivity : ComponentActivity() {
         val passwordStored = influxDraft.password.isBlank() || settings.setInfluxPassword(influxDraft.password)
         settings.setInfluxDatabase(influxDraft.database)
         settings.setInfluxMeasurement(influxDraft.measurement)
+        settings.setInfluxVehicleId(influxDraft.vehicleId)
         val stored = usernameStored && passwordStored
         if (!stored) {
             influxDraft = influxDraft.copy(
@@ -2327,6 +2484,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun validateInfluxDraft(selected: HaEndpointProfile? = null): Boolean {
+        if (selected == null && !InfluxConfig.isValidVehicleId(influxDraft.vehicleId)) {
+            Toast.makeText(this, strings(uiLanguage).haIdentity.invalidInfluxVehicleId, Toast.LENGTH_LONG).show()
+            return false
+        }
         val valid = when (selected) {
             HaEndpointProfile.PRIMARY -> validEndpointDraft(influxDraft.host, influxDraft.port)
             HaEndpointProfile.ALTERNATIVE -> validEndpointDraft(influxDraft.alternativeHost, influxDraft.alternativePort)

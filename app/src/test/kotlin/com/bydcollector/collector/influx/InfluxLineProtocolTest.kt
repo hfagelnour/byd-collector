@@ -2,6 +2,7 @@ package com.bydcollector.collector.influx
 
 import kotlin.test.Test
 import kotlin.test.assertFalse
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 class InfluxLineProtocolTest {
@@ -29,6 +30,25 @@ class InfluxLineProtocolTest {
         assertTrue(line.contains("unit=kW\\ h"))
         assertTrue(line.contains("value_str=\"quoted \\\"value\\\"\""))
         assertTrue(line.contains("source_poll_id=42i"))
+    }
+
+    @Test
+    fun vehicleIdUsesDefaultForBlankAndEscapesCustomTagCharacters() {
+        val row = row()
+        val defaultLine = InfluxLineProtocol.toLine(row, config(vehicleId = ""))
+        val customLine = InfluxLineProtocol.toLine(row, config(vehicleId = "custom car,ev=2"))
+
+        assertTrue(defaultLine.contains("vehicle=sea_lion_07"))
+        assertTrue(customLine.contains("vehicle=custom\\ car\\,ev\\=2"))
+    }
+
+    @Test
+    fun vehicleIdCannotInjectNewLineOrNulTags() {
+        for (vehicleId in listOf("car\rtag", "car\ntag", "car\u0000tag")) {
+            assertFailsWith<IllegalArgumentException> {
+                InfluxLineProtocol.toLine(row(), config(vehicleId = vehicleId))
+            }
+        }
     }
 
     @Test
@@ -135,7 +155,7 @@ class InfluxLineProtocolTest {
         assertFalse(config().isCategoryEnabled("location"))
     }
 
-    private fun config(): InfluxConfig = InfluxConfig(
+    private fun config(vehicleId: String = InfluxConfig.DEFAULT_VEHICLE_ID): InfluxConfig = InfluxConfig(
         enabled = true,
         host = "influx.local",
         port = 8086,
@@ -143,6 +163,23 @@ class InfluxLineProtocolTest {
         username = null,
         password = null,
         measurement = "byd_state",
-        enabledCategories = setOf("battery")
+        enabledCategories = setOf("battery"),
+        vehicleId = vehicleId
+    )
+
+    private fun row() = InfluxPendingHistoryRow(
+        id = 10,
+        fieldKey = "soc_display_percent",
+        category = "battery",
+        valueType = "NUMBER",
+        valueText = null,
+        valueNumber = 73.0,
+        valueBool = null,
+        quality = "OK",
+        unit = "%",
+        sourcePollId = 42,
+        sourceKeys = "soc_display_percent",
+        observedAt = "2026-06-15T10:20:30Z",
+        changedAt = "2026-06-15T10:20:31Z"
     )
 }

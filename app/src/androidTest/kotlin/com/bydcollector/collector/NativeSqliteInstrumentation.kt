@@ -49,6 +49,8 @@ class NativeSqliteInstrumentation : Instrumentation() {
     private var fixtureLanguage = "uk"
     private var workerReplayFixture: String? = null
     private var runtimeBoundaryFixture = false
+    private var mqttCleanupRuntimeFixture = false
+    private var mqttCleanupUiFixture: String? = null
 
     override fun onCreate(arguments: Bundle?) {
         super.onCreate(arguments)
@@ -60,6 +62,8 @@ class NativeSqliteInstrumentation : Instrumentation() {
         fixtureLanguage = arguments?.getString("language") ?: "uk"
         workerReplayFixture = arguments?.getString("workerReplayFixture")
         runtimeBoundaryFixture = arguments?.getString("runtimeBoundary") == "true"
+        mqttCleanupRuntimeFixture = arguments?.getString("mqttCleanupRuntime") == "true"
+        mqttCleanupUiFixture = arguments?.getString("mqttCleanupUi")
         start()
     }
 
@@ -74,6 +78,18 @@ class NativeSqliteInstrumentation : Instrumentation() {
                     WorkerReplayParcelGate.run(File(targetContext.cacheDir, "${prefix}_worker_replay"), File(path))
                 } finally { cleanupTestFiles() }
             }
+            finish(if (result.isSuccess) Activity.RESULT_OK else Activity.RESULT_CANCELED,
+                Bundle().apply { putString("stream", result.getOrElse { it.stackTraceToString() }) })
+            return
+        }
+        if (mqttCleanupRuntimeFixture) {
+            val result = runCatching { MqttCleanupRuntimeGate.run(this) }
+            finish(if (result.isSuccess) Activity.RESULT_OK else Activity.RESULT_CANCELED,
+                Bundle().apply { putString("stream", result.getOrElse { it.stackTraceToString() }) })
+            return
+        }
+        mqttCleanupUiFixture?.let { action ->
+            val result = runCatching { MqttCleanupUiFixture.run(targetContext, action) }
             finish(if (result.isSuccess) Activity.RESULT_OK else Activity.RESULT_CANCELED,
                 Bundle().apply { putString("stream", result.getOrElse { it.stackTraceToString() }) })
             return

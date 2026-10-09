@@ -59,7 +59,7 @@ class DashboardStateProvider(
         vehicleKpiLanguage: VehicleKpiLanguage = VehicleKpiLanguage.UK
     ): DashboardState {
         if (com.bydcollector.collector.BuildConfig.RUNTIME_CLIENT) {
-            com.bydcollector.collector.runtime.RuntimePreferences.refresh(context)
+            if (profile != DashboardLoadProfile.INITIAL) com.bydcollector.collector.runtime.RuntimePreferences.refresh(context)
             return com.bydcollector.collector.runtime.RuntimeReads.read(context, "dashboard", android.os.Bundle().apply {
                 putString("profile", profile.name)
                 putString("language", vehicleKpiLanguage.name)
@@ -259,6 +259,10 @@ class DashboardStateProvider(
             mqttClientId = mqttConfig?.clientId.orEmpty(),
             mqttTopicPrefix = mqttConfig?.topicPrefix.orEmpty(),
             mqttDiscoveryPrefix = mqttConfig?.discoveryPrefix.orEmpty(),
+            mqttDeviceId = mqttConfig?.deviceId.orEmpty(),
+            mqttDeviceIdentifier = mqttConfig?.deviceIdentifier.orEmpty(),
+            mqttDeviceName = mqttConfig?.deviceName.orEmpty(),
+            mqttDeviceModel = mqttConfig?.deviceModel.orEmpty(),
             mqttEnabledCategories = mqttConfig?.enabledCategories ?: emptySet(),
             mqttStatus = mqttStatus,
             mqttLastError = health.mqttLastError,
@@ -278,6 +282,7 @@ class DashboardStateProvider(
             influxUsername = "",
             influxPasswordSet = previous?.influxPasswordSet ?: false,
             influxMeasurement = influxConfig?.measurement.orEmpty(),
+            influxVehicleId = influxConfig?.vehicleId.orEmpty(),
             influxEnabledCategories = influxConfig?.enabledCategories ?: emptySet(),
             influxStatus = influxStatus,
             influxPendingRows = if (useInfluxState) influxState.pendingRows else previous?.influxPendingRows ?: 0L,

@@ -8,6 +8,17 @@ import kotlin.test.assertNull
 
 class HaMqttConfigTest {
     @Test
+    fun deviceIdRejectsTopicSyntaxAndNonAsciiButPreservesEmptyDefault() {
+        listOf("my/car", "my+car", "my#car", "my car", " car", "авто", "car\n").forEach { id ->
+            assertNotNull(config().copy(deviceId = id).validateIdentity(), id)
+        }
+        listOf("my_car-2", "A0", "", "   ").forEach { id ->
+            assertNull(config().copy(deviceId = id).validateIdentity(), id)
+        }
+        assertEquals(HaDiscoveryBuilder.DEVICE_ID, config().copy(deviceId = "").normalizedDeviceId())
+    }
+
+    @Test
     fun partialAlternativePairIsInvalidAndDoesNotFallbackSilently() {
         val config = config(alternativeHost = "mqtt-alt.local")
 

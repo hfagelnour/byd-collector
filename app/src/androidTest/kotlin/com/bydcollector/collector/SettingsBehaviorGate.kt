@@ -11,6 +11,7 @@ import com.bydcollector.collector.data.direct.DirectHelperReadResult
 import com.bydcollector.collector.data.direct.DirectHelperStopResult
 import com.bydcollector.collector.data.direct.DirectVehicleHelper
 import com.bydcollector.collector.data.remote.DirectBridgeManager
+import com.bydcollector.collector.influx.InfluxConfig
 import com.bydcollector.collector.maintenance.ArchiveStorageItemPhase
 import com.bydcollector.collector.maintenance.ArchiveStorageItemState
 import com.bydcollector.collector.maintenance.ArchiveStorageJobMode
@@ -231,6 +232,25 @@ internal object SettingsBehaviorGate {
                     check(!reopened.keepAliveConfig().keepBluetooth)
                     check(reopened.mqttConfig(includeCredentials = false).discoveryEnabled)
                 }
+            }
+        },
+        "influx_vehicle_id_defaults_and_persists_independently" to {
+            isolated(context, prefix) { scoped ->
+                val settings = CollectorSettings(scoped)
+                check(settings.influxVehicleId() == InfluxConfig.DEFAULT_VEHICLE_ID)
+                check(settings.influxConfig(includeCredentials = false).vehicleId == InfluxConfig.DEFAULT_VEHICLE_ID)
+
+                settings.setMqttDeviceId("mqtt-device")
+                settings.setInfluxVehicleId("custom car,ev=2")
+                val reopened = CollectorSettings(scoped)
+                check(reopened.influxVehicleId() == "custom car,ev=2")
+                check(reopened.influxConfig(includeCredentials = false).vehicleId == "custom car,ev=2")
+                check(reopened.mqttDeviceId() == "mqtt-device")
+
+                reopened.setInfluxVehicleId("")
+                check(CollectorSettings(scoped).influxVehicleId() == InfluxConfig.DEFAULT_VEHICLE_ID)
+                reopened.setInfluxVehicleId("\n")
+                check(CollectorSettings(scoped).influxVehicleId() == "\n")
             }
         },
         "settings_templates_language_and_navigation_survive_reopen" to {
